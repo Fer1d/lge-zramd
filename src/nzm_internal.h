@@ -6,7 +6,6 @@
 #include "runtime.h"
 
 #define MIB UINT64_C(1048576)
-#define RUN "/dev/lge-zram-manager"
 #define WEAR "/mnt/vendor/persist/lge-zram-wear"
 #define Z "/sys/block/zram0/"
 #define RCTX "u:object_r:lge_zram_runtime_file:s0"
@@ -24,6 +23,8 @@ int nzm_sleep_seconds(uint64_t seconds);
 int nzm_core_control(struct nzm_core *c, enum nzm_runtime_boundary boundary);
 int nzm_core_observe(struct nzm_core *c, uint64_t seconds);
 int nzm_core_ready(struct nzm_core *c);
+/* Trusted read-only boot identity; does not initialize startup ownership. */
+int nzm_core_bootid(struct nzm_core *c);
 int nzm_directory(const char *path);
 int nzm_private(const char *path, const char *ctx);
 int nzm_rawread(const char *p, char *b, size_t cap);
@@ -32,6 +33,9 @@ int nzm_text(int fd, const char *name, const char *ctx, char *b,
 int nzm_absent(int fd, const char *name);
 int nzm_create_text(int fd, const char *name, const char *ctx,
                        const char *s);
+int nzm_core_authority(struct nzm_core *c);
+int nzm_state_absent(struct nzm_core *c, const char *name);
+int nzm_state_text(struct nzm_core *c, const char *name, char *b, size_t cap);
 int nzm_mark(struct nzm_core *c, const char *name, const char *s);
 int nzm_put(const char *p, const char *s);
 int nzm_putnum(const char *p, uint64_t v);
@@ -39,7 +43,9 @@ int nzm_number(const char *p, uint64_t *v);
 int nzm_fields(const char *p, uint64_t *v, size_t count);
 uint64_t nzm_nowtime(void);
 int nzm_monotonic_now(uint64_t *tick);
+#ifdef NZM_LEGACY_TEST
 int nzm_wear(struct nzm_core *c, struct nzm_ledger *l);
+#endif
 int nzm_pause_verified(struct nzm_core *c, int *paused);
 int nzm_phase1_policy(struct nzm_core *c, int *paused);
 int nzm_identity(struct nzm_core *c, struct nzm_helper_identity *id);
@@ -59,8 +65,10 @@ int nzm_dm_activate(struct nzm_core *c, const struct nzm_helper_identity *id);
 int nzm_space(struct nzm_core *c);
 int nzm_health(struct nzm_core *c);
 int nzm_power_policy(int *off, int *charging);
+#ifdef NZM_LEGACY_TEST
 int nzm_elapsed(uint64_t now,uint64_t since,uint64_t interval);
 int nzm_sample_plan(struct nzm_core *c, struct nzm_cycle_policy *policy, struct nzm_plan *plan);
+#endif
 /* Core-owned synchronous execution adapter, not part of frozen transport.
  * sample/precheck are read-only. EAGAIN means global quota wait, not fallback.
  * execute requires the durable planned-KiB reservation; never retries EXEC. */

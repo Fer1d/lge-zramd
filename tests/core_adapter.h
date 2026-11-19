@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 int test_open(const char *, int, ...);
+int test_openat(int, const char *, int, ...);
+#define openat test_openat
 int test_fstat(int, struct stat *);
 ssize_t test_xattr(int, const char *, void *, size_t);
 ssize_t test_write(int, const void *, size_t);
@@ -19,6 +21,7 @@ int test_stat(const char *, struct stat *);
 #ifndef NZM_RECOVERY_ADAPTER
 static inline int test_mounts_verify(void) { return 0; }
 #define nzm_mounts_verify test_mounts_verify
+#define nzm_persist_verify test_mounts_verify
 #endif
 #ifdef NZM_INTEGRATION
 #include "nzm_io.h"
@@ -55,7 +58,5 @@ int test_helper_call_with_mask(enum nzm_helper_op, const struct nzm_helper_ident
 
 #ifdef NZM_INTEGRATION
 long test_sysconf(int);
-int test_openat(int, const char *, int, ...);
 #define sysconf test_sysconf
-#define openat test_openat
 #endif

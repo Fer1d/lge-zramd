@@ -46,7 +46,7 @@ static int fixture_fstat(int fd,struct stat *s) {
 static ssize_t fixture_xattr(int fd,const char *name,void *b,size_t cap) {
  (void)name;assert(!(fcntl(fd,F_GETFL)&O_PATH));
  char p[512];fixture_path(fd,p,sizeof p);
- const char *label=strstr(p,"lge-zram-wear")?"u:object_r:extm_wear_dir:s0":"u:object_r:lge_zram_runtime_file:s0";
+ const char *label=strstr(p,"/boot-state")?"u:object_r:extm_wear_ledger:s0":"u:object_r:extm_wear_dir:s0";
  if(bad_label)label="u:object_r:tmpfs:s0";
  size_t n=strlen(label)+1;assert(n<=cap);memcpy(b,label,n);return (ssize_t)n;
 }
@@ -85,7 +85,7 @@ int main(void) {
  assert(!strcmp(strict_strtok_r(NULL,"/",&state),"etc")&&!state);
  strcpy(fixture,"/tmp/nzm-directory-XXXXXX");assert(mkdtemp(fixture));
  dir("/mnt",0755);dir("/mnt/vendor",0755);dir("/mnt/vendor/persist",0771);dir("/mnt/vendor/persist/lge-zram-wear",0700);
- dir("/dev",0755);dir("/dev/lge-zram-manager",0700);dir("/vendor",0755);dir("/vendor/etc",0755);dir("/sys",0755);dir("/sys/block",0755);
+ dir("/vendor",0755);dir("/vendor/etc",0755);dir("/sys",0755);dir("/sys/block",0755);
  /* Verify simulated SELinux denial is live, not accidentally bypassed. */
  int root=open(fixture,O_PATH|O_DIRECTORY);assert(root>=0);
  assert(fixture_openat(root,"mnt",O_RDONLY|O_DIRECTORY|O_NOFOLLOW)==-1&&errno==EACCES);close(root);
@@ -104,15 +104,17 @@ int main(void) {
  assert(!rename(a,b));assert(!symlink("realvendor",a));assert(nzm_directory(WEAR)<0);assert(!unlink(a));assert(!rename(b,a));
  snprintf(a,sizeof a,"%s/mnt/vendor/persist/lge-zram-wear",fixture);snprintf(b,sizeof b,"%s/mnt/vendor/persist/realwear",fixture);
  assert(!rename(a,b));assert(!symlink("realwear",a));assert(nzm_private(WEAR,WCTX)<0);assert(!unlink(a));assert(!rename(b,a));
- d=nzm_private(RUN,RCTX);assert(d>=0);
- assert(!nzm_create_text(d,"minfree",RCTX,"100 200\n"));
- char value[64];assert(!nzm_text(d,"minfree",RCTX,value,sizeof value));assert(!strcmp(value,"100 200\n"));assert(!unlinkat(d,"minfree",0));close(d);
+ d=nzm_private(WEAR,WCTX);assert(d>=0);
+ const char *state_ctx="u:object_r:extm_wear_ledger:s0";
+ assert(!nzm_create_text(d,"boot-state",state_ctx,"100 200\n"));
+ char value[64];assert(!nzm_text(d,"boot-state",state_ctx,value,sizeof value));assert(!strcmp(value,"100 200\n"));
+ assert(nzm_create_text(d,"boot-state",state_ctx,"overwrite\n")==-EEXIST);
+ assert(!unlinkat(d,"boot-state",0));close(d);
  d=nzm_directory("/vendor/etc");assert(d>=0&&!(fcntl(d,F_GETFL)&O_PATH));close(d);
  d=nzm_directory("/vendor/etc///");assert(d>=0&&!(fcntl(d,F_GETFL)&O_PATH));close(d);
- change("/dev/lge-zram-manager",0755);assert(nzm_private(RUN,RCTX)==-EPERM);change("/dev/lge-zram-manager",0700);
  d=nzm_directory("/sys/block");assert(d>=0&&!(fcntl(d,F_GETFL)&O_PATH));close(d);
  assert(nzm_directory("/mnt/../vendor/etc")==-EINVAL);
- const char *dirs[]={"/mnt/vendor/persist/lge-zram-wear","/mnt/vendor/persist","/mnt/vendor","/mnt","/dev/lge-zram-manager","/dev","/vendor/etc","/vendor","/sys/block","/sys"};
+ const char *dirs[]={"/mnt/vendor/persist/lge-zram-wear","/mnt/vendor/persist","/mnt/vendor","/mnt","/vendor/etc","/vendor","/sys/block","/sys"};
  for(size_t i=0;i<sizeof dirs/sizeof dirs[0];i++){snprintf(a,sizeof a,"%s%s",fixture,dirs[i]);assert(!rmdir(a));}assert(!rmdir(fixture));
- puts("directory: O_PATH ancestors, tmpfs read denial, root-owned ancestors and scoped persist system-write trust, leaf metadata/xattr, symlinks, RUN/minfree/vendor/sys passed");return 0;
+ puts("directory: O_PATH ancestors, tmpfs read denial, root-owned ancestors and scoped persist system-write trust, leaf metadata/xattr, symlinks, wear/checkpoint/vendor/sys passed");return 0;
 }

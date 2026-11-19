@@ -23,19 +23,21 @@
 #endif
 
 int nzm_core_vm(struct nzm_core *c, int completed) {
+  int owned = nzm_core_authority(c);
+  if (owned) return owned;
   const char *intent =
       completed ? "vm-attempted-completed" : "vm-attempted-boot";
   const char *done = completed ? "vm-complete-completed" : "vm-complete-boot";
   char b[256];
-  int rc = nzm_absent(c->runfd, intent);
+  int rc = nzm_state_absent(c, intent);
   if (rc == -EEXIST) {
-    rc = nzm_text(c->runfd, done, RCTX, b, sizeof b);
+    rc = nzm_state_text(c, done, b, sizeof b);
     return rc ? rc : strcmp(b, "verified\n") ? -EPERM : 0;
   }
   if (rc)
     return rc;
   uint64_t base, target;
-  rc = nzm_text(c->runfd, "minfree", RCTX, b, sizeof b);
+  rc = nzm_state_text(c, "minfree", b, sizeof b);
   if (rc == -ENOENT) {
     if ((rc = nzm_number("/proc/sys/vm/min_free_kbytes", &base)))
       return rc;

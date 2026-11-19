@@ -159,22 +159,18 @@ int nzm_dm_activate(struct nzm_core *c, const struct nzm_helper_identity *id) {
   return activate(c, 0, id);
 }
 int nzm_ram_boot(struct nzm_core *c) {
+  int owned = nzm_core_authority(c);
+  if (owned) return owned;
   static const char marker[] = "ram-only";
-  const struct nzm_meta meta = {0, 0, 0600, 1, RCTX};
   char record[sizeof c->boot];
-  size_t len;
-  int rc = nzm_absent(c->runfd, marker);
+  int rc = nzm_state_absent(c, marker);
   if (rc == -EEXIST) {
-    rc = nzm_io_read_at(c->runfd, marker, &meta, record, sizeof record, &len);
-    if (rc)
-      return rc;
-    if (len != sizeof record - 1 || memcmp(record, c->boot, len))
-      return -ESTALE;
-    rc = nzm_io_read_at(c->runfd, ram_attempt, &meta, record, sizeof record, &len);
-    if (rc)
-      return rc;
-    if (len != sizeof record - 1 || memcmp(record, c->boot, len))
-      return -ESTALE;
+    rc = nzm_state_text(c, marker, record, sizeof record);
+    if (rc) return rc;
+    if (strcmp(record, c->boot)) return -ESTALE;
+    rc = nzm_state_text(c, ram_attempt, record, sizeof record);
+    if (rc) return rc;
+    if (strcmp(record, c->boot)) return -ESTALE;
     int fd = open("/dev/block/zram0", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0)
       return -errno;
@@ -188,7 +184,7 @@ int nzm_ram_boot(struct nzm_core *c) {
     }
     return rc;
   }
-  if (rc || (rc = nzm_absent(c->runfd, ram_attempt)))
+  if (rc || (rc = nzm_state_absent(c, ram_attempt)))
     return rc;
   rc = activate(c, 1, NULL);
   /* Keep the attempt fence even on failure. Only verified success can resume. */

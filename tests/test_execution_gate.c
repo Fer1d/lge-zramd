@@ -127,6 +127,7 @@ int nzm_diag(struct nzm_core *c, const char *stage, int rc) {c->stage=stage;retu
 static void *worker(void *arg) {
   struct fixture *f=arg;
   nzm_config_default(&f->core.config);
+  f->core.execution.next_request_id=1; /* Fixture bypasses nzm_core_init(). */
   f->rc=nzm_execution_select(&f->core);
   if(!f->rc) {
     f->core.reserved=f->core.intent_owned=1;

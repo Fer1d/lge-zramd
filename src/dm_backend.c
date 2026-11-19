@@ -35,9 +35,11 @@ static int step(struct nzm_core *c, enum nzm_helper_op op,
   return rc;
 }
 int nzm_dm_boot(struct nzm_core *c) {
+  int owned = nzm_core_authority(c);
+  if (owned) return owned;
   struct nzm_helper_identity id;
   struct nzm_helper_result r;
-  int rc = nzm_absent(c->runfd, "managed");
+  int rc = nzm_state_absent(c, "managed");
   if (rc == -EEXIST) {
     rc = nzm_dm_quota();
     if (!rc) rc = nzm_managed(c);
@@ -45,12 +47,12 @@ int nzm_dm_boot(struct nzm_core *c) {
   }
   if (rc) return rc;
   /* RAM ownership resumes only as RAM. Incomplete DM ownership never replays. */
-  if ((rc = nzm_absent(c->runfd, "acquire-intent")) ||
-      (rc = nzm_absent(c->runfd, "bootstrap-result")) ||
+  if ((rc = nzm_state_absent(c, "acquire-intent")) ||
+      (rc = nzm_state_absent(c, "bootstrap-result")) ||
       (rc = nzm_no_mapping())) return rc;
-  rc = nzm_absent(c->runfd, "ram-only");
+  rc = nzm_state_absent(c, "ram-only");
   if (rc == -EEXIST) return nzm_ram_boot(c);
-  if (rc || (rc = nzm_absent(c->runfd, "ram-only-attempted")) ||
+  if (rc || (rc = nzm_state_absent(c, "ram-only-attempted")) ||
       (rc = nzm_cold())) return rc;
   if (!c->config.enable_writeback) return nzm_ram_boot(c);
   rc = nzm_existing_identity(c, &id, 1);

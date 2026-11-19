@@ -1,9 +1,9 @@
 #define _GNU_SOURCE
 #include "nzm_internal.h"
 #include "demand_exec.h"
+#include "log.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/sysmacros.h>
@@ -20,6 +20,9 @@ static int real_guard(void *p, struct nzm_core *c) {
   if(!rc)rc=nzm_pause_verified(c,&paused);
   if(!rc && paused)rc=-EPERM;
   if(!rc)rc=nzm_managed(c);
+  if(!rc)rc=nzm_absent(c->wearfd,"ledger.new");
+  if(!rc)rc=nzm_absent(c->wearfd,"ledger.txn");
+  if(!rc)rc=nzm_intent_check(c);
   return rc;
 }
 static int real_status(void *p, struct nzm_core *c, struct rb_status_result *s) {
@@ -51,38 +54,6 @@ static int real_demand(void *p, struct nzm_demand_view *v) {
   nzm_spawn_fd_leave(&g);
   return rc;
 }
-static int real_ledger(void *p,struct nzm_core *c,struct nzm_ledger *l) {
-  (void)p;
-  int paused=0,rc=nzm_pause_verified(c,&paused);
-  if(!rc && paused)rc=-EPERM;
-  if(!rc)rc=nzm_absent(c->wearfd,"ledger.new");
-  if(!rc)rc=nzm_absent(c->wearfd,"ledger.txn");
-  if(!rc)rc=nzm_intent_check(c);
-  if(rc)return rc;
-  char *b=malloc(NZM_LEDGER_MAX_BYTES);size_t n=0;
-  if(!b)return -ENOMEM;
-  const struct nzm_meta meta={0,0,0600,1,LCTX};
-  rc=nzm_io_read_at(c->wearfd,"ledger",&meta,b,NZM_LEDGER_MAX_BYTES,&n);
-  uint64_t highwater=0;
-  if(!rc) {
-    /* Bound token extraction; the strict parser validates the complete record. */
-    size_t i=8;
-    if(n<12 || memcmp(b,"wear-v1 ",8))rc=-EPROTO;
-    else {
-      while(i<n && b[i]>='0' && b[i]<='9')i++;
-      if(i==8 || i>=n || b[i++]!=' ')rc=-EPROTO;
-      size_t begin=i;
-      while(!rc && i<n && b[i]>='0' && b[i]<='9') {
-        unsigned d=(unsigned)(b[i++]-'0');
-        if(highwater>(UINT64_MAX-d)/10)rc=-ERANGE;
-        else highwater=highwater*10+d;
-      }
-      if(!rc && (i==begin || i>=n || b[i]!=' '))rc=-EPROTO;
-    }
-  }
-  if(!rc)rc=nzm_ledger_parse(b,n,highwater ? highwater : 1,l);
-  free(b);return rc;
-}
 static int real_quota(void *p,uint64_t limit) {
   (void)p;
   /* Zero first, including when enable writes/readback fail. */
@@ -98,9 +69,6 @@ static int real_quota(void *p,uint64_t limit) {
 }
 static int real_intent(void *p,struct nzm_core *c,const struct nzm_plan *plan) {
   (void)p;return nzm_intent_create(c,plan);
-}
-static int real_commit(void *p,struct nzm_core *c,const char *s,size_t n) {
-  (void)p;return nzm_io_ledger_commit(c->wearfd,s,n,WCTX,LCTX);
 }
 static int real_exec(void *p,struct nzm_core *c,struct nzm_demand_exec_wire *w) {
   (void)p;
@@ -137,11 +105,13 @@ static int real_exec(void *p,struct nzm_core *c,struct nzm_demand_exec_wire *w) 
 static int real_retire(void *p,struct nzm_core *c) {
   (void)p;return nzm_intent_retire(c);
 }
-static int real_preflight(void *p,struct nzm_core *c,size_t n) {
-  (void)p;return nzm_io_ledger_preflight(c->wearfd,n);
+static int real_now(void *p,uint64_t *now) {
+  (void)p;return nzm_memory_now(now);
 }
-static const struct nzm_demand_exec_ops real_ops={real_guard,real_status,real_demand,
-  real_ledger,real_quota,real_intent,real_commit,real_exec,real_retire,real_preflight};
+static const struct nzm_demand_exec_ops real_ops={
+  .guard=real_guard,.status=real_status,.demand=real_demand,.quota=real_quota,
+  .intent=real_intent,.exec=real_exec,.retire=real_retire,.now=real_now
+};
 
 static int bound(const struct rb_status_result *s,const struct nzm_demand_view *v) {
   if(!s->known || s->selection!=RB_BACKEND_REQUEST || !s->ready ||
@@ -190,72 +160,76 @@ int nzm_core_demand_exec(struct nzm_core *c,struct nzm_demand_exec_state *state,
                          const struct nzm_demand_exec_ops *ops,void *p) {
   const struct nzm_demand_exec_ops *o=ops ? ops : &real_ops;
   int rc=-EINVAL,dirty=0;
-  char *text=NULL;size_t length=0;struct nzm_ledger l={0};
+  uint64_t request_id=0,now=0;
   struct rb_status_result s={0};struct nzm_demand_view v={0};
+  if(state) {
+    state->attempted=state->known=state->settled=0;
+    state->known_submitted_kib=state->pending_kib=0;
+    state->granted_pages=0;state->budget_deadline_ns=0;
+    memset(&state->reply,0,sizeof state->reply);
+  }
+  if(c) {
+    memset(&c->execution.result,0,sizeof c->execution.result);
+    memset(&c->last_plan,0,sizeof c->last_plan);c->reserved=c->attempted=0;
+  }
   if(!o->quota)return -EINVAL;
   int zero=o->quota(p,0);
-  if(zero) {
-    rc=zero;
-    if(state)state->halted=1;
-    if(c)c->execution.halted=1;
-    goto done;
+  if(zero) {rc=zero;goto done;}
+  if(!c || !state || !o->guard || !o->status || !o->demand ||
+     !o->intent || !o->exec || !o->retire || !o->now)goto done;
+  if(state->halted || c->execution.halted || c->memory_budget.halted || c->intent_owned) {
+    rc=-EPERM;goto done;
   }
-  if(!c || !state || !o->guard || !o->status || !o->demand || !o->ledger ||
-     !o->intent || !o->commit || !o->exec || !o->retire || !o->preflight)goto done;
-  if(state->halted || c->execution.halted || c->intent_owned) {rc=-EPERM;goto done;}
-  state->attempted=state->known=0;state->granted_pages=0;
-  if(!c->boot_completed || !c->config.enable_writeback || !c->config.demand_enabled) {rc=-EAGAIN;goto done;}
-  if(!state->next_request_id) {rc=-EOVERFLOW;goto done;}
+  if(!c->boot_completed || !c->config.enable_writeback || !c->config.demand_enabled) {
+    rc=-EAGAIN;goto done;
+  }
   if((rc=o->guard(p,c)) || (rc=o->status(p,c,&s)) || (rc=o->demand(p,&v)) ||
      (rc=bound(&s,&v)))goto done;
   if(state->expected_sequence && state->expected_sequence!=v.sequence) {rc=-EAGAIN;goto done;}
-  if((rc=o->ledger(p,c,&l)))goto done;
-  /* Never let RTC validation expire wear credits. Recompute against persisted
-   * highwater, ignoring used_kib/validated_at sampled by nzm_wear at wall time. */
-  uint64_t frozen=l.highwater ? l.highwater : 1,used=0;
-  for(size_t i=0;i<l.count;i++) {
-    if(l.records[i].timestamp>frozen || UINT64_MAX-used<l.records[i].kib) {rc=-ERANGE;goto done;}
-    if(frozen-l.records[i].timestamp<NZM_LEDGER_WINDOW_SECONDS)used+=l.records[i].kib;
-  }
-  l.validated_at=frozen;
+  if(!c->execution.next_request_id) {rc=-EOVERFLOW;goto done;}
   if(!c->config.daily_mib || c->config.daily_mib>UINT64_MAX/1024 ||
      !c->config.demand_batch_mib || c->config.demand_batch_mib>UINT64_MAX/1024 ||
      !c->config.demand_scan_limit || c->config.demand_scan_limit==UINT64_MAX ||
      !v.min_age_seconds || v.min_age_seconds>UINT64_MAX/1000000000) {rc=-EINVAL;goto done;}
+  if((rc=o->now(p,&now)))goto done;
   uint64_t daily=c->config.daily_mib*1024,grant=c->config.demand_batch_mib*1024;
-  if(used>=daily) {rc=-EDQUOT;goto done;}
-  if(grant>daily-used)grant=daily-used;
-  grant/=s.page_size/1024;
+  uint64_t available=0,page_kib=s.page_size/1024;
+  if((rc=nzm_memory_available(&c->memory_budget,now,daily,&available)) ||
+     (rc=nzm_memory_due(&c->memory_budget,now,daily,page_kib,page_kib,
+                        &state->budget_deadline_ns)))goto done;
+  if(grant>available)grant=available;
+  grant/=page_kib;
   if(grant>c->config.demand_scan_limit)grant=c->config.demand_scan_limit;
   uint64_t diskpages=s.disksize_bytes/s.page_size;
   if(grant>diskpages)grant=diskpages;
   if(!grant) {rc=-EDQUOT;goto done;}
-  struct nzm_plan plan={.pages=grant,.reserve_kib=grant*(s.page_size/1024),.limit_4k=grant*(s.page_size/4096)};
-  rc=nzm_ledger_reserve_text(&l,frozen,plan.reserve_kib,daily,&text,&length);
-  if(rc)goto done;
+  struct nzm_plan plan={.pages=grant,.reserve_kib=grant*page_kib,
+                       .limit_4k=grant*(s.page_size/4096)};
+  if((rc=recheck(o,p,c,&s,&v)))goto done;
+  if((rc=nzm_memory_reserve(&c->memory_budget,now,plan.reserve_kib,daily)))goto done;
   c->execution.backend=RB_BACKEND_REQUEST;c->execution.selected=1;
-  c->execution.identity=s.identity;c->execution.next_request_id=state->next_request_id;
-  c->last_plan=plan;c->reserved=c->attempted=0;
-  memset(&c->execution.result,0,sizeof c->execution.result);
-  if((rc=recheck(o,p,c,&s,&v)) || (rc=o->preflight(p,c,length)))goto done;
-  dirty=1; /* Failed creation may already have left durable/partial evidence. */
-  if((rc=o->intent(p,c,&plan)) || (rc=recheck(o,p,c,&s,&v)) ||
-     (rc=o->commit(p,c,text,length)))goto done;
-  c->reserved=1;state->granted_pages=grant;
+  c->execution.identity=s.identity;c->last_plan=plan;c->reserved=1;
+  state->granted_pages=grant;
+  request_id=c->execution.next_request_id;
+  dirty=1; /* Even failed creation may leave durable/partial intent evidence. */
+  rc=o->intent(p,c,&plan);
+  c->execution.next_request_id=request_id==UINT64_MAX ? 0 : request_id+1;
+  if(rc)goto done;
+  nzm_log("demand reserve request_id=%llu grant_pages=%llu available_kib=%llu",
+      (unsigned long long)request_id,(unsigned long long)grant,(unsigned long long)available);
   if((rc=recheck(o,p,c,&s,&v)) || (rc=o->quota(p,plan.limit_4k)) ||
      (rc=recheck(o,p,c,&s,&v)))goto done;
   struct nzm_demand_exec_wire w={0};
-  w.exec.size=sizeof w;w.exec.version=1;w.exec.request_id=state->next_request_id;
+  w.exec.size=sizeof w;w.exec.version=1;w.exec.request_id=request_id;
   w.exec.expected_instance=s.identity.instance;w.exec.expected_generation=s.identity.generation;
   w.exec.max_attempt_pages=w.exec.max_installed_pages=grant;
   w.demand_sequence=v.sequence;w.max_scanned_pages=c->config.demand_scan_limit;
   w.min_age_ns=v.min_age_seconds*UINT64_C(1000000000);
   w.start_index=state->next_index%diskpages;
   struct nzm_demand_exec_wire input=w;
-  state->next_request_id=state->next_request_id==UINT64_MAX ? 0 : state->next_request_id+1;
   state->attempted=1;c->execution.result.no_replay=1;
-  rc=o->exec(p,c,&w); /* Exactly one call. No EINTR/EFAULT retry. */
-  zero=o->quota(p,0); /* Close authorization before any postcondition work. */
+  rc=o->exec(p,c,&w); /* Exactly once, including EINTR/EFAULT. */
+  zero=o->quota(p,0); /* Close authorization before postcondition work. */
   if(rc)goto done;
   if(!exact(&input,&w,diskpages)) {rc=-EPROTO;goto done;}
   state->known=1;state->reply=w;
@@ -263,31 +237,55 @@ int nzm_core_demand_exec(struct nzm_core *c,struct nzm_demand_exec_state *state,
   c->execution.result.counters=(struct rb_request_counters){w.exec.scanned_pages,
     w.exec.selected_pages,w.exec.submitted_pages,w.exec.installed_pages,w.exec.invalidated_pages};
   if(zero) {rc=zero;goto done;}
-  if(w.exec.op_errno) {rc=w.exec.op_errno;goto done;}
-  /* Execution may itself deactivate demand and advance its sequence. Postcheck
-   * lifecycle/authority, not the obsolete pre-execution demand predicate. */
+  /* EXEC can deactivate demand; postcheck authority/lifecycle, not old demand. */
   struct rb_status_result post={0};
   if((rc=o->guard(p,c)) || (rc=o->status(p,c,&post)))goto done;
-  if(!post.known || !post.ready || post.identity.instance!=s.identity.instance ||
+  if(!post.known || !post.ready || post.selection!=RB_BACKEND_REQUEST ||
+     post.identity.instance!=s.identity.instance ||
      post.identity.generation!=s.identity.generation || post.page_size!=s.page_size ||
      post.disksize_bytes!=s.disksize_bytes) {rc=-ESTALE;goto done;}
+  uint64_t completion=0;
+  if((rc=o->now(p,&completion)))goto done;
+  if(completion<now) {rc=-ESTALE;goto done;}
+  if(w.exec.submitted_pages>UINT64_MAX/page_kib) {rc=-EOVERFLOW;goto done;}
+  uint64_t submitted=w.exec.submitted_pages*page_kib;
+  if((rc=nzm_memory_settle_known(&c->memory_budget,completion,submitted)))goto done;
+  state->settled=1;
+  if((rc=nzm_memory_due(&c->memory_budget,completion,daily,page_kib,page_kib,
+                        &state->budget_deadline_ns)))goto done;
+  /* A valid op error accounts submissions but never retires evidence. */
+  if(w.exec.op_errno) {rc=w.exec.op_errno;goto done;}
   if((rc=o->retire(p,c)))goto done;
   state->next_index=w.next_index;dirty=0;
  done:
-  free(text);nzm_ledger_free(&l);
-  zero=o->quota(p,0);
-  if(zero)rc=zero;
-  if(state && c && (dirty || zero)) {state->halted=1;c->execution.halted=1;}
+  /* Retain the full outstanding reservation on every uncertain path. The last
+   * validated time is sufficient: unknown reservations never age or refund. */
+  if(c && dirty && c->memory_budget.pending) {
+    int retained=nzm_memory_retain_unknown(&c->memory_budget,c->memory_budget.last_ns);
+    if(retained && !rc)rc=retained;
+  }
+  int close_error=o->quota(p,0);
+  if(close_error) {zero=close_error;rc=close_error;}
+  if(state && (dirty || zero))state->halted=1;
+  if(c && (dirty || zero))c->execution.halted=1;
+  if(state && c) {
+    state->known_submitted_kib=c->memory_budget.known_submitted_kib;
+    state->pending_kib=c->memory_budget.pending_kib;
+    const struct zram_wb_exec *e=&state->reply.exec;
+    nzm_log("demand outcome boot=%s request_id=%llu sequence=%llu approved_pages=%llu attempted=%d known=%d scanned=%llu submitted=%llu installed=%llu settled=%d known_submitted_kib=%llu pending_kib=%llu errno=%d stop=%u quota_closed=%d halted=%d",
+        c->boot,(unsigned long long)request_id,(unsigned long long)v.sequence,
+        (unsigned long long)state->granted_pages,state->attempted,state->known,
+        (unsigned long long)e->scanned_pages,(unsigned long long)e->submitted_pages,
+        (unsigned long long)e->installed_pages,state->settled,
+        (unsigned long long)state->known_submitted_kib,(unsigned long long)state->pending_kib,
+        -rc,e->stop_reason,!zero,state->halted);
+  }
   return rc;
 }
 
 int nzm_demand_execute(struct nzm_core *c,const struct nzm_demand_view *view) {
-  /* Watcher is the single worker owner. Its view is a wake hint only; coherent
-   * demand is reread and validated against fresh STATUS inside the transaction. */
   if(!c)return -EINVAL;
-  struct nzm_demand_exec_state state={.next_request_id=c->execution.selected ?
-    c->execution.next_request_id : 1,.expected_sequence=view ? view->sequence : 0};
-  int rc=nzm_core_demand_exec(c,&state,NULL,NULL);
-  c->execution.next_request_id=state.next_request_id;
-  return rc;
+  /* Ephemeral view/cursor state never resets the core-owned budget or ID. */
+  struct nzm_demand_exec_state state={.expected_sequence=view ? view->sequence : 0};
+  return nzm_core_demand_exec(c,&state,NULL,NULL);
 }

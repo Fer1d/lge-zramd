@@ -13,21 +13,29 @@
 /* Main owns only immutable launch config and runtime handle. Everything in
  * core (including partial initialization and teardown) belongs to the worker.
  * runtime publishes exited only AFTER finalize, then joins, then closes its FDs. */
+#ifdef NZM_LEGACY_TEST
 struct event_owner {
   struct nzm_config launch;
   int trusted, initialized, terminal;
   struct nzm_core core;
   struct nzm_runtime *runtime;
 };
+#endif
 int nzm_core_control(struct nzm_core *c, enum nzm_runtime_boundary boundary) {
   if(!c->control)return 0;
+#ifdef NZM_LEGACY_TEST
   int action=nzm_runtime_control_check(c->control,boundary);
   if(action<0)return action;
   if(!action)return 0;
   c->cooperative_stop=1;
   return nzm_diag(c,action==NZM_CONTROL_STOP_RETAIN_RESERVATION ?
       "stopped_retain_reservation" : "stopped_before_commit",-ECANCELED);
+#else
+  (void)boundary;
+  return -EOPNOTSUPP;
+#endif
 }
+#ifdef NZM_LEGACY_TEST
 int nzm_core_observe(struct nzm_core *c, uint64_t seconds) {
   if(!c->control)return nzm_sleep_seconds(seconds);
   int rc=nzm_core_control(c,NZM_BOUNDARY_OBSERVING);
@@ -166,3 +174,4 @@ int nzm_event_daemon(const struct nzm_config *config,int trusted_boot_completed)
   free(owner);
   return rc;
 }
+#endif /* NZM_LEGACY_TEST */

@@ -12,39 +12,32 @@ struct nzm_demand_exec_wire {
 };
 #define NZM_DEMAND_EXEC_IOCTL _IOWR('Z', 0x22, struct nzm_demand_exec_wire)
 struct nzm_demand_exec_state {
-  uint64_t next_request_id; /* Initialize to 1; zero means exhausted. */
   uint64_t next_index;
   uint64_t expected_sequence; /* Optional watcher wake token; mismatch defers. */
-  int halted, attempted, known;
+  int halted, attempted, known, settled;
+  uint64_t known_submitted_kib, pending_kib;
   uint64_t granted_pages;
+  uint64_t budget_deadline_ns; /* BOOTTIME when at least one page fits. */
   struct nzm_demand_exec_wire reply;
 };
-/* All callbacks return zero or negative errno, never retry. exec is one ioctl
- * maximum; ANY failure is conservatively unknown, even failure before entry.
- * quota must set enable=1, set the limit, then verify both by readback. guard
- * verifies pause, stop and managed identity; it must NOT require quota zero.
- * ledger returns owned records (freed by the caller). commit is durable.
- * Injection replaces boundaries, not transaction ordering/accounting. */
+/* Injectable IO boundaries, not accounting. All return zero or negative errno.
+ * quota verifies enable=1 and requested limit by readback. guard checks control,
+ * pause, identity, old transaction files and any non-owned execution intent.
+ * Any exec failure is unknown and is never retried. now supplies BOOTTIME. */
 struct nzm_demand_exec_ops {
   int (*guard)(void *, struct nzm_core *);
   int (*status)(void *, struct nzm_core *, struct rb_status_result *);
   int (*demand)(void *, struct nzm_demand_view *);
-  int (*ledger)(void *, struct nzm_core *, struct nzm_ledger *);
   int (*quota)(void *, uint64_t limit_4k);
   int (*intent)(void *, struct nzm_core *, const struct nzm_plan *);
-  int (*commit)(void *, struct nzm_core *, const char *, size_t);
   int (*exec)(void *, struct nzm_core *, struct nzm_demand_exec_wire *);
   int (*retire)(void *, struct nzm_core *);
-  /* Before intent: extra whole replacement bytes plus filesystem reserve.
-   * commit independently rechecks before mutating its transaction. */
-  int (*preflight)(void *, struct nzm_core *, size_t);
+  int (*now)(void *, uint64_t *);
 };
-/* Single worker owner with run lock held and boot/provision complete. NULL ops
- * selects real core/IO helpers. One finite transaction per call; attempt and
- * installed caps equal the grant, bounded by batch, frozen-highwater wear
- * availability and scan cap. Never refunds or retries.
- * Every exit attempts verified zero quota, including invalid/paused/unknown.
- * Errors after intent creation latch halted and preserve evidence. */
+/* The core owns the memory budget and request ID across calls. Reserve memory,
+ * create durable intent, then open quota. A known reply settles submissions only
+ * after closure, fresh STATUS and fresh time. Unknown/uncertain outcomes retain
+ * the full reservation, halt, and preserve intent. Every exit closes quota. */
 int nzm_core_demand_exec(struct nzm_core *, struct nzm_demand_exec_state *,
                          const struct nzm_demand_exec_ops *, void *);
 int nzm_demand_execute(struct nzm_core *, const struct nzm_demand_view *);

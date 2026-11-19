@@ -5,6 +5,10 @@
 #include <string.h>
 static int intent, managed, ram, attempt, mapping, identity_error, fail_op, drift;
 static int helpers, mutations, activated, fallback, enabled, limit, bound;
+int nzm_core_authority(struct nzm_core *c) { (void)c; return 0; }
+int nzm_state_absent(struct nzm_core *c, const char *name) {
+  return nzm_absent(c->wearfd,name);
+}
 int nzm_absent(int fd, const char *name) {
   (void)fd;
   int exists = !strcmp(name,"managed") ? managed :

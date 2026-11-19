@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "nzm_internal.h"
 #include "recovery.h"
+#include "log.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,7 +26,7 @@
 int nzm_diag(struct nzm_core *c, const char *stage, int rc) {
   if (!strcmp(stage,"query")) return rc;
   c->stage = stage;
-  fprintf(stderr,"trigger=%s watermark=%d resident_bytes=%" PRIu64 " candidate_upper=%" PRIu64 " free_backing_pages=%" PRIu64 " plan_pages=%" PRIu64 " no_progress=%d budget_reserved=%d\n",
+  nzm_log("trigger=%s watermark=%d resident_bytes=%" PRIu64 " candidate_upper=%" PRIu64 " free_backing_pages=%" PRIu64 " plan_pages=%" PRIu64 " no_progress=%d budget_reserved=%d\n",
       c->trigger ? c->trigger : "none",c->watermark,c->last_plan.resident_bytes,
       c->last_plan.candidate_upper,c->last_plan.free_backing_pages,c->last_plan.pages,c->no_progress,c->reserved);
   int emit = 1;
@@ -51,7 +52,7 @@ int nzm_diag(struct nzm_core *c, const char *stage, int rc) {
       result->counters.installed_pages,result->known,result->op_errno,result->stop_reason,
       result->error_stage,result->no_replay,result->transport.close_errno);
   if (emit)
-    fprintf(stderr,
+    nzm_log(
             "stage=%s errno=%d reserved=%d attempted=%d "
             "observed_global_before=%" PRIu64 " observed_global_after=%" PRIu64
             " observed_before_valid=%d observed_after_valid=%d "
@@ -59,44 +60,17 @@ int nzm_diag(struct nzm_core *c, const char *stage, int rc) {
             stage, rc < 0 ? -rc : rc, c->reserved, c->attempted,
             c->observed_before, c->observed_after, c->observed_before_valid,
             c->observed_after_valid,request);
-  /* Only the acquired manager lock owns the shared persistent snapshot. */
-  if (emit && c->runfd >= 0 && c->lock.fd >= 0) {
-    char record[1024];
-    int n =
-        snprintf(record, sizeof record,
-                 "stage=%s errno=%d reserved=%d attempted=%d before_valid=%d "
-                 "before=%" PRIu64 " after_valid=%d after=%" PRIu64
-                 " pause_errno=%d trigger=%s watermark=%d resident=%" PRIu64 " candidate=%" PRIu64 " free_backing=%" PRIu64 " pages=%" PRIu64 " no_progress=%d %s\n",
-                 stage, rc < 0 ? -rc : rc, c->reserved, c->attempted,
-                 c->observed_before_valid, c->observed_before,
-                 c->observed_after_valid, c->observed_after, c->pause_errno,
-                 c->trigger ? c->trigger : "none",c->watermark,c->last_plan.resident_bytes,
-                 c->last_plan.candidate_upper,c->last_plan.free_backing_pages,c->last_plan.pages,c->no_progress,request);
-    int fd =
-        openat(c->runfd, "last-event",
-               O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0600);
-    int logrc = fd < 0 ? -errno : 0;
-    if (fd >= 0) {
-      const struct nzm_meta m = {0, 0, 0600, 1, RCTX};
-      logrc = nzm_io_check(fd, S_IFREG, &m);
-      if (!logrc && ftruncate(fd, 0))
-        logrc = -errno;
-      if (!logrc)
-        logrc = nzm_io_sysfs_write(fd, record, (size_t)n < sizeof record ? (size_t)n : sizeof record-1);
-      if (!logrc && fsync(fd))
-        logrc = -errno;
-      close(fd);
-      if (!logrc && fsync(c->runfd))
-        logrc = -errno;
-    }
-    c->snapshot_errno = logrc < 0 ? -logrc : logrc;
-    if (logrc)
-      fprintf(stderr, "runtime_snapshot=unknown errno=%d\n", -logrc);
+  /* Ordinary events are process-local. Startup checkpoints alone are durable. */
+  if (emit) {
+    snprintf(c->last_event, sizeof c->last_event,
+        "stage=%s errno=%d reserved=%d attempted=%d %s\n",
+        stage, rc < 0 ? -rc : rc, c->reserved, c->attempted, request);
+    c->snapshot_errno = 0;
   }
   return rc;
 }
 int nzm_diag_config_error(const char *stage, const char *field, const char *reason, int rc) {
-  fprintf(stderr,"config_stage=%s field=%s reason=%s errno=%d "
+  nzm_log("config_stage=%s field=%s reason=%s errno=%d "
           "expected_uid=0 expected_gid=0 expected_mode=0644 "
           "expected_label=u:object_r:vendor_configs_file:s0\n",
           stage,field,reason,-rc);
@@ -167,32 +141,42 @@ int nzm_core_status(struct nzm_core *c, FILE *out) {
           "exact_request_proof=unknown\nbacking_mib=%" PRIu64
           " batch_mib=%" PRIu64 " daily_mib=%" PRIu64 "\n",
           c->config.backing_mib, c->config.batch_mib, c->config.daily_mib);
-  struct nzm_ledger l = {0};
-  int rc = nzm_wear(c, &l);
+  fputs("budget_scope=process_local reset=controller_object_restart "
+        "running_daemon_budget=unknown\n"
+        "budget=unknown history=running_controller_only historical_ledger=ignored\n"
+        "budget_policy=rolling_86400_seconds time_basis=CLOCK_BOOTTIME "
+        "bucket_seconds=900 completed_expiry=86400_seconds_after_bucket_end\n"
+        "accounting=submitted_when_known unknown=full_reservation "
+        "known_zero=refund_unused unknown_halts=controller_object "
+        "charge_time=completion pending_expiry=never\n", out);
+  int paused = 0;
+  int rc = nzm_core_bootid(c);
+  if (!rc) rc = nzm_persist_verify();
+  int opened = 0;
+  if (!rc && c->wearfd < 0) {
+    c->wearfd = nzm_private(WEAR, WCTX);
+    if (c->wearfd < 0) rc = c->wearfd;
+    else opened = 1;
+  }
+  if (!rc) rc = nzm_phase1_policy(c, &paused);
   if (rc)
-    fprintf(out, "budget=unknown-or-persistent-pause-or-pending errno=%d\n",
-            -rc);
+    fprintf(out, "demand_authority=unknown errno=%d\n", -rc);
   else
-    fprintf(out,
-            "budget=valid reserved_rolling_kib=%" PRIu64
-            " cumulative_kib=%" PRIu64 " generation=%" PRIu64 "\n",
-            l.used_kib, l.cumulative, l.generation);
-  nzm_ledger_free(&l);
-  int fd = nzm_private(RUN, RCTX);
+    fprintf(out, "demand_authority=%s reason=%s\n",
+        paused ? "blocked" : "valid",
+        paused ? "persistent_pause_or_pending_evidence" : "authority_verified");
   char b[1024];
-  int r = fd < 0 ? fd : nzm_text(fd, "managed", RCTX, b, sizeof b);
-  if (r)
-    fprintf(out, "managed_marker=unknown errno=%d\n", -r);
-  else
-    fprintf(out, "managed_marker=%s", b);
-  r=fd<0 ? fd : nzm_text(fd,"last-event",RCTX,b,sizeof b);
-  if(r)fprintf(out,"last_event=unknown errno=%d\n",-r);
-  else fprintf(out,"last_event_disk_snapshot=%s",b);
-  if (fd >= 0)
-    close(fd);
+  struct nzm_boot_state state;
+  nzm_boot_init(&state);
+  int r = rc ? rc : nzm_boot_load(&state, c->wearfd);
+  if (!r) r = nzm_boot_text(&state, "managed", b, sizeof b);
+  if (r) fprintf(out, "managed_checkpoint=unknown errno=%d\n", -r);
+  else fprintf(out, "managed_checkpoint=%s", b);
+  fputs("last_event=process_local running_daemon_event=unknown\n", out);
   const char *nodes[] = {"disksize", "backing_dev", "bd_stat",
-                         "writeback_limit", "writeback_limit_enable"};
-  for (size_t i = 0; i < 5; i++) {
+                         "writeback_limit", "writeback_limit_enable",
+                         "pool_policy", "pool_demand"};
+  for (size_t i = 0; i < sizeof nodes / sizeof nodes[0]; i++) {
     char p[128];
     snprintf(p, sizeof p, Z "%s", nodes[i]);
     r = nzm_rawread(p, b, sizeof b);
@@ -201,5 +185,6 @@ int nzm_core_status(struct nzm_core *c, FILE *out) {
     else
       fprintf(out, "%s=%s", nodes[i], b);
   }
+  if (opened) { close(c->wearfd); c->wearfd = -1; }
   return 0;
 }

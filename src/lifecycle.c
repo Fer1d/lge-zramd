@@ -28,11 +28,13 @@
 void nzm_core_init(struct nzm_core *c) {
   memset(c, 0, sizeof *c);
   c->runfd = c->wearfd = c->datafd = c->lock.fd = -1;
+  nzm_boot_init(&c->boot_state);
+  (void)nzm_memory_init(&c->memory_budget, 0);
+  c->execution.next_request_id = 1;
   nzm_config_default(&c->config);
 }
 void nzm_core_close(struct nzm_core *c) {
-  if (c->lock.fd >= 0)
-    nzm_io_unlock(c->runfd, &c->lock);
+  nzm_boot_close(&c->boot_state);
   if (c->runfd >= 0)
     close(c->runfd);
   if (c->wearfd >= 0)
@@ -73,7 +75,7 @@ int nzm_core_config(struct nzm_core *c) {
   close(f);
   return rc;
 }
-static int bootid(struct nzm_core *c) {
+int nzm_core_bootid(struct nzm_core *c) {
   char b[64];
   int rc = nzm_rawread("/proc/sys/kernel/random/boot_id", b, sizeof b);
   if (rc)
@@ -90,23 +92,38 @@ static int bootid(struct nzm_core *c) {
   strcpy(c->boot, b);
   return 0;
 }
-static int start(struct nzm_core *c, int ram_only) {
-  int rc = bootid(c);
-  if (rc)
-    return rc;
-  c->runfd = nzm_private(RUN, RCTX);
-  if (c->runfd < 0)
-    return c->runfd;
-  if (ram_only) {
-    /* The lock, VM checkpoints, and diagnostics may write only to RAM. */
-    struct statfs fs;
-    if (fstatfs(c->runfd, &fs))
-      return -errno;
-    if (fs.f_type != TMPFS_MAGIC)
-      return -EXDEV;
-  }
-  return nzm_io_lock(c->runfd, RCTX, &c->lock);
+static int start(struct nzm_core *c, int phase1) {
+  (void)phase1;
+  int rc = nzm_core_bootid(c);
+  if (!rc) rc = nzm_persist_verify();
+  if (rc) return rc;
+  c->wearfd = nzm_private(WEAR, WCTX);
+  if (c->wearfd < 0) return c->wearfd;
+  if ((rc = nzm_boot_lock(&c->boot_state, c->wearfd))) return rc;
+  c->lock.fd = c->boot_state.authority_fd;
+  c->lock.dev = c->boot_state.authority_dev;
+  c->lock.ino = c->boot_state.authority_ino;
+  /* Bind startup-mutating configuration, not scheduler knobs or structure
+   * padding. Same-boot config changes never acquire or retune a live device. */
+  char binding[NZM_BOOT_BINDING_MAX];
+  int n = snprintf(binding, sizeof binding,
+      "%" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+      " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64,
+      c->config.enable_writeback, c->config.expected_bytes, c->config.disksize_bytes,
+      c->config.vm_swappiness, c->config.vm_page_cluster,
+      c->config.vm_watermark_scale_factor, c->config.vm_extra_free_kbytes,
+      c->config.vm_min_free_kbytes, c->config.vm_minfree_mult,
+      c->config.vm_overcommit_memory, c->config.vm_laptop_mode);
+  if (n < 0 || (size_t)n >= sizeof binding) return -EOVERFLOW;
+  rc = nzm_boot_load(&c->boot_state, c->wearfd);
+  if (!rc && !strcmp(c->boot_state.boot, c->boot))
+    return strcmp(c->boot_state.binding, binding) ? -ESTALE : 0;
+  if (rc && rc != -ENOENT) return rc;
+  /* A missing or previous-boot checkpoint is never proof of ownership. */
+  if ((rc = nzm_cold()) || (rc = nzm_no_mapping())) return rc;
+  return nzm_boot_reset(&c->boot_state, c->boot, binding);
 }
+#ifdef NZM_LEGACY_TEST
 static int data_ready(struct nzm_core *c) {
   /* One recovery attempt only. Handshake/storage uncertainty never retries. */
   return nzm_core_provision(c);
@@ -117,12 +134,14 @@ int nzm_core_boot(struct nzm_core *c) {
     return nzm_diag(c, "startup_lock", rc);
   if ((rc = nzm_mounts_verify()))
     return nzm_diag(c, "mounted_provenance", rc);
-  struct nzm_ledger l = {0};
-  rc = nzm_wear(c, &l);
-  nzm_ledger_free(&l);
+  /* Historical module entry only: its frozen executor consumes wear-v1.
+   * Production CLI uses nzm_phase1_start/demand_watch and the wear-v2 store. */
+  struct nzm_ledger ledger = {0};
+  rc = nzm_wear(c, &ledger);
+  nzm_ledger_free(&ledger);
   if (rc)
     return nzm_stop(c, "authority_ledger", rc);
-  rc = nzm_absent(c->runfd, "managed");
+  rc = nzm_state_absent(c, "managed");
   if (rc == -EEXIST) {
     if ((rc = nzm_managed(c)))
       return nzm_stop(c, "resume_identity", rc);
@@ -133,8 +152,8 @@ int nzm_core_boot(struct nzm_core *c) {
   }
   if (rc)
     return nzm_stop(c, "marker", rc);
-  if ((rc = nzm_absent(c->runfd, "acquire-intent")) ||
-      (rc = nzm_absent(c->runfd, "bootstrap-result")) || (rc = nzm_cold()) ||
+  if ((rc = nzm_state_absent(c, "acquire-intent")) ||
+      (rc = nzm_state_absent(c, "bootstrap-result")) || (rc = nzm_cold()) ||
       (rc = nzm_no_mapping()))
     return nzm_stop(c, "cold_ownership", rc);
   if((rc=nzm_core_control(c,NZM_BOUNDARY_OBSERVING)))return rc;
@@ -176,6 +195,7 @@ int nzm_core_boot(struct nzm_core *c) {
     return nzm_stop(c, "backend_select", rc);
   return nzm_diag(c, "boot_verified", 0);
 }
+#endif
 static int completed(void) {
 #ifdef __ANDROID__
   char b[PROP_VALUE_MAX];
@@ -202,7 +222,7 @@ int nzm_phase1_start(struct nzm_core *c, int daemon) {
     return nzm_diag(c, "dm_or_ram_activation", rc);
   if ((rc = nzm_core_vm(c, 0)))
     return nzm_diag(c, "vm_boot", rc);
-  int bound = nzm_absent(c->runfd, "managed");
+  int bound = nzm_state_absent(c, "managed");
   if (bound && bound != -EEXIST) return bound;
   nzm_diag(c, bound == -EEXIST ? (paused ? "paused_dm_bound_disarmed" : "dm_bound_disarmed")
                              : (paused ? "paused_ram_only_verified" : "ram_only_verified"), 0);
@@ -221,6 +241,7 @@ int nzm_phase1_start(struct nzm_core *c, int daemon) {
   if(demand)nzm_diag(c,"demand_disabled_swap_retained",demand);
   return 0;
 }
+#ifdef NZM_LEGACY_TEST
 int nzm_core_ready(struct nzm_core *c) {
   int rc = nzm_core_boot(c);
   if (rc)
@@ -251,3 +272,5 @@ int nzm_core_daemon(struct nzm_core *c) {
       return rc;
   }
 }
+
+#endif /* NZM_LEGACY_TEST */

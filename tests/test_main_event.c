@@ -147,6 +147,7 @@ int event_open(const char *p, int flags, ...) {
     }
     CHECK(p[0]=='/');
     if (f.phase1) {
+        CHECK(strncmp(p,WEAR "/ledger",strlen(WEAR "/ledger")));
         CHECK(strncmp(p,"/data",5) && strncmp(p,"/proc/pressure",14));
         if (flags&(O_RDWR|O_WRONLY|O_CREAT))
             CHECK(!strcmp(p,Z "disksize") || !strcmp(p,"/dev/block/zram0") ||
@@ -163,7 +164,11 @@ int event_openat(int d, const char *p, int flags, ...) {
         char target[1024];
         const char *leaf=leafpath(d,target,sizeof target);
         CHECK(strcmp(p,"data") && strncmp(leaf,"/data",5));
-        if (flags&(O_RDWR|O_WRONLY|O_CREAT)) CHECK(!strcmp(leaf,RUN));
+        if (!strcmp(leaf,WEAR)) CHECK(strncmp(p,"ledger",6));
+        if (flags&(O_RDWR|O_WRONLY|O_CREAT)) {
+            CHECK(!strcmp(leaf,WEAR));
+            CHECK(!strcmp(p,"boot-state.txn") || !strcmp(p,"boot-state.new"));
+        }
     }
     return openat(d,p,flags,mode);
 }
@@ -172,11 +177,17 @@ int event_fstat(int fd, struct stat *st) {
     char p[1024]; project(leafpath(fd,p,sizeof p),st); return 0;
 }
 int event_fstatfs(int fd, struct statfs *fs) {
-    char p[1024];
-    CHECK(!strcmp(leafpath(fd,p,sizeof p),RUN));
-    memset(fs,0,sizeof *fs);
-    if (!f.disk_backed_runtime) fs->f_type=TMPFS_MAGIC;
-    return 0;
+    (void)fd; (void)fs; CHECK(0); return -1; /* No runtime mount is consulted. */
+}
+static int checkpoint(const char *name) {
+    char p[1024]; path(p,sizeof p,WEAR);
+    int fd=open(p,O_RDONLY|O_DIRECTORY|O_CLOEXEC); CHECK(fd>=0);
+    struct nzm_boot_state state; nzm_boot_init(&state);
+    int rc=nzm_boot_load(&state,fd);
+    CHECK(!close(fd));
+    if(rc==-ENOENT) return 0;
+    CHECK(!rc); rc=nzm_boot_absent(&state,name); CHECK(!rc || rc==-EEXIST);
+    return rc==-EEXIST;
 }
 static int pathstat(const char *p, struct stat *st, int nofollow) {
     owner(); char mapped[1024]; path(mapped,sizeof mapped,p);
@@ -194,7 +205,7 @@ ssize_t event_xattr(int fd, const char *name, void *buf, size_t size) {
     else if (!strncmp(leaf,WEAR,strlen(WEAR))) {
         type="extm_wear_dir";
         if (strstr(leaf,"/authority")) type="extm_wear_authority";
-        else if (strstr(leaf,"/ledger") || strstr(leaf,"/exec.intent")) type="extm_wear_ledger";
+        else if (strstr(leaf,"/ledger") || strstr(leaf,"/exec.intent") || strstr(leaf,"/boot-state")) type="extm_wear_ledger";
         else if (strstr(leaf,"/pause")) type="extm_wear_pause";
     } else if (!strncmp(leaf,"/data/extm",10)) {
         type="extm_root_data";
@@ -214,12 +225,9 @@ static void publish(enum phase p, int wait) {
 }
 ssize_t event_write(int fd, const void *buf, size_t size) {
     owner(); char p[1024]; const char *leaf=leafpath(fd,p,sizeof p);
-    if (!strcmp(leaf,RUN "/last-event")) {
-        CHECK(size<sizeof f.last_event); memcpy(f.last_event,buf,size); f.last_event[size]=0;
-    }
     if (!strcmp(leaf,Z "disksize")) {
         f.disksize_writes++;
-        if (f.phase1) CHECK(exists(RUN "/ram-only-attempted"));
+        if (f.phase1) CHECK(checkpoint("ram-only-attempted"));
         if (f.fail_disksize) { errno=EIO; return -1; }
         if (f.bind_during_init) put(Z "backing_dev","/dev/block/dm-0\n");
         CHECK(!ftruncate(fd,0)); CHECK(lseek(fd,0,SEEK_SET)==0);
@@ -339,7 +347,7 @@ int event_sleep(const struct timespec *delay, struct timespec *left) {
     owner(); (void)left;
     if (f.phase1) {
         CHECK(delay->tv_sec==5 && !delay->tv_nsec && f.boot_wait && !f.sleeps);
-        CHECK(exists(RUN "/vm-complete-boot") && !exists(RUN "/vm-complete-completed"));
+        CHECK(checkpoint("vm-complete-boot") && !checkpoint("vm-complete-completed"));
         f.sleeps++;
         put("/proc/sys/vm/min_free_kbytes","700\n");
         return 0;
@@ -561,7 +569,7 @@ static void setup(const struct scenario *s) {
         "/sys/class/backlight","/sys/class/backlight/panel0-backlight",
         "/sys/class/power_supply","/sys/class/power_supply/battery"};
     for (size_t i=0;i<sizeof dirs/sizeof *dirs;i++) dir(dirs[i],0755);
-    dir(RUN,0700); dir("/data",0771); dir("/data/extm",0700);
+    dir("/data",0771); dir("/data/extm",0700);
     dir("/mnt/vendor/persist",0771); dir(WEAR,0700);
     put("/data/extm/owner","extm-dm-owner-v1\n");
     put(WEAR "/authority","extm-wear-v1\n"); put(WEAR "/ledger","wear-v1 0 0 0\n");
@@ -607,6 +615,9 @@ static int remove_one(const char *p, const struct stat *st, int type, struct FTW
 }
 static void run_case(const struct scenario *s) {
     setup(s); sigset_t initial,original,blocked,after;
+    FILE *log=tmpfile(); CHECK(log); fflush(stderr);
+    int saved_stderr=dup(STDERR_FILENO); CHECK(saved_stderr>=0);
+    CHECK(dup2(fileno(log),STDERR_FILENO)>=0);
     CHECK(!pthread_sigmask(SIG_SETMASK,NULL,&initial)); original=initial;
     CHECK(!sigaddset(&original,SIGUSR1)); CHECK(!sigdelset(&original,SIGTERM));
     CHECK(!sigdelset(&original,SIGINT)); CHECK(!sigdelset(&original,SIGHUP));
@@ -617,7 +628,7 @@ static void run_case(const struct scenario *s) {
         CHECK(!pthread_create(&thread,NULL,producer,NULL));
     }
     CHECK(!pthread_sigmask(SIG_SETMASK,&original,NULL));
-    /* Retained Stage 3 module regression, not the Phase 1 production CLI. */
+    /* Explicit legacy-v1 Stage 3 module regression, not production fallback. */
     struct nzm_core c;
     nzm_core_init(&c);
     CHECK(!nzm_core_config(&c));
@@ -640,10 +651,16 @@ static void run_case(const struct scenario *s) {
     CHECK(!pthread_sigmask(SIG_SETMASK,NULL,&after));
     for (int sig=1;sig<NSIG;sig++) CHECK(sigismember(&original,sig)==sigismember(&after,sig));
     if (s->event) CHECK(!pthread_join(thread,NULL));
+    fflush(stderr); CHECK(dup2(saved_stderr,STDERR_FILENO)>=0); CHECK(!close(saved_stderr));
+    rewind(log); char line[2048];
+    while(fgets(line,sizeof line,log)) if(!strncmp(line,"stage=",6)) {
+        CHECK(strlen(line)<sizeof f.last_event); strcpy(f.last_event,line);
+    }
+    CHECK(!fclose(log));
     CHECK(rc==(s->exec_error || !s->event ? 1:0));
     CHECK(f.helpers[NZM_HELPER_PREPARE]==1 && f.helpers[NZM_HELPER_CREATE]==1 && f.helpers[NZM_HELPER_BIND]==1);
     CHECK(f.swaps==1 && number("/proc/sys/vm/min_free_kbytes")==200);
-    CHECK(exists(RUN "/vm-complete-completed") && !exists(RUN "/lock"));
+    CHECK(checkpoint("vm-complete-completed") && !exists(RUN));
     CHECK(f.config_opens==1);
     int early=s->stop_at==PH_BEFORE || s->stop_at==PH_OBSERVING || s->stop_at==PH_PRECOMMIT ||
         s->stop_at==PH_INTENT_SYNC || s->policy_block;
@@ -689,7 +706,8 @@ static void run_case(const struct scenario *s) {
 static void phase1_case(const char *name) {
     const struct scenario s={.backend="ioctl",.event=1,.psi=PSI_REAL_PRI};
     setup(&s); f.phase1=1;
-    /* Historical RAM-only cases explicitly disable the newly available DM backend. */
+    /* RAM-only fixtures disable physical-backend acquisition. Authority and
+     * pending fences remain independent of this optional backend setting. */
     char cfgpath[1024]; path(cfgpath,sizeof cfgpath,"/vendor/etc/lge-zram.conf");
     FILE *cfg=fopen(cfgpath,"a"); CHECK(cfg);
     CHECK(fputs("enable_writeback=0\n",cfg)>=0 && !fclose(cfg));
@@ -708,13 +726,27 @@ static void phase1_case(const char *name) {
     if (!strcmp(name,"bad-authority")) {
         put(WEAR "/authority","foreign\n"); put(WEAR "/pause",pause);
     }
-    if (!strcmp(name,"pending")) put(WEAR "/ledger.txn","preserve transaction\n");
+    const char *pending = !strcmp(name,"pending") ? "ledger.txn" :
+        !strcmp(name,"pending-new") ? "ledger.new" :
+        !strcmp(name,"pending-intent") ? "exec.intent" : NULL;
+    if (pending) {
+        char leaf[128]; snprintf(leaf,sizeof leaf,WEAR "/%s",pending);
+        put(leaf,"preserve unresolved evidence\n");
+    }
+    if (!strcmp(name,"missing-ledger")) {
+        path(p,sizeof p,WEAR "/ledger"); CHECK(!unlink(p));
+    }
     if (!strcmp(name,"bad-ledger")) put(WEAR "/ledger","malformed\n");
+    if (!strcmp(name,"exhausted-ledger"))
+        put(WEAR "/ledger","wear-v1 1 0 18446744073709551615\n0 18446744073709551615\n");
     if (!strcmp(name,"bad-persist")) put("/proc/self/mountinfo","untrusted\n");
     if (!strcmp(name,"backed")) put(Z "backing_dev","/dev/block/dm-0\n");
     if (!strcmp(name,"active-foreign"))
         put("/proc/swaps","Filename Type Size Used Priority\n/dev/block/zram0 partition 65532 0 -2\n");
-    if (!strcmp(name,"old-marker")) put(RUN "/managed","old boot\n");
+    if (!strcmp(name,"old-marker")) {
+        /* Malformed persistent startup state is never an ownership proof. */
+        put(WEAR "/boot-state","old boot\n");
+    }
     if (!strcmp(name,"wrong-device")) put(Z "dev","1:2\n");
     if (!strcmp(name,"existing-dm")) {
         dir("/sys/block/dm-0",0755); dir("/sys/block/dm-0/dm",0755);
@@ -722,16 +754,24 @@ static void phase1_case(const char *name) {
     }
     f.wrong_label=!strcmp(name,"wrong-label");
     f.boot_wait=!strcmp(name,"paused-wait");
-    f.disk_backed_runtime=!strcmp(name,"disk-runtime");
     f.bind_during_init=!strcmp(name,"bind-race");
     f.fail_disksize=!strcmp(name,"attempt-not-replayed");
-    int success=paused || !strcmp(name,"ordinary");
+    int success=paused || pending || !strcmp(name,"ordinary") ||
+        !strcmp(name,"missing-ledger") || !strcmp(name,"bad-ledger") ||
+        !strcmp(name,"exhausted-ledger") || !strcmp(name,"no-runtime-directory");
+    char old_ledger[128]; size_t old_ledger_len=0;
+    path(p,sizeof p,WEAR "/ledger");
+    int old_ledger_fd=open(p,O_RDONLY);
+    if (old_ledger_fd>=0) {
+        ssize_t n=read(old_ledger_fd,old_ledger,sizeof old_ledger); CHECK(n>0);
+        old_ledger_len=(size_t)n; CHECK(!close(old_ledger_fd));
+    } else CHECK(errno==ENOENT);
     char *boot[]={"native-zram-manager","boot","--confirmed",NULL};
     char *daemon[]={"native-zram-manager","daemon","--confirmed","--boot-completed",NULL};
     if (boot_only) {
         CHECK(!nzm_entry(3,boot));
         CHECK(f.swaps==1 && f.disksize_writes==1 && !f.completed_reads);
-        CHECK(exists(RUN "/vm-complete-boot") && !exists(RUN "/vm-complete-completed"));
+        CHECK(checkpoint("vm-complete-boot") && !checkpoint("vm-complete-completed"));
         put("/proc/sys/vm/min_free_kbytes","700\n");
     }
     CHECK(nzm_entry(f.boot_wait ? 3 : 4,daemon)==!success);
@@ -739,11 +779,14 @@ static void phase1_case(const char *name) {
         CHECK(!number(Z "disksize"));
         f.fail_disksize=0;
         CHECK(nzm_entry(3,boot)==1); /* still cold, but the attempt fence wins */
-        CHECK(f.disksize_writes==1 && exists(RUN "/ram-only-attempted"));
+        CHECK(f.disksize_writes==1 && checkpoint("ram-only-attempted"));
     }
     CHECK(f.swaps==(unsigned)success);
-    CHECK(exists(RUN "/ram-only")==success && !exists(RUN "/lock"));
-    CHECK(exists(RUN "/vm-complete-completed")==success);
+    if(strcmp(name,"old-marker")) {
+        CHECK(checkpoint("ram-only")==success);
+        CHECK(checkpoint("vm-complete-completed")==success);
+    }
+    CHECK(!exists(RUN));
     CHECK(number("/proc/sys/vm/min_free_kbytes")== (success ? 200 : 100));
     CHECK(f.completed_reads==(unsigned)(f.boot_wait ? 2 : 0));
     CHECK(!f.execs && !f.status_calls && !f.legacy_calls && !f.idle_writes && !f.quota_writes);
@@ -754,6 +797,21 @@ static void phase1_case(const char *name) {
     }
     if (!strcmp(name,"ordinary")) CHECK(ledger()==0 && !exists(WEAR "/pause"));
     if (boot_only) CHECK(exists(WEAR "/exec.intent"));
+    if (pending) {
+        char leaf[128]; snprintf(leaf,sizeof leaf,WEAR "/%s",pending);
+        path(p,sizeof p,leaf); char text[64];
+        int fd=open(p,O_RDONLY); CHECK(fd>=0);
+        ssize_t n=read(fd,text,sizeof text-1); CHECK(n>0); text[n]=0;
+        CHECK(!close(fd) && !strcmp(text,"preserve unresolved evidence\n"));
+    }
+    path(p,sizeof p,WEAR "/ledger");
+    int fd=open(p,O_RDONLY);
+    if (old_ledger_len) {
+        char text[128]; CHECK(fd>=0);
+        CHECK(read(fd,text,sizeof text)==(ssize_t)old_ledger_len);
+        CHECK(!memcmp(text,old_ledger,old_ledger_len) && !close(fd));
+    } else CHECK(fd<0 && errno==ENOENT);
+    CHECK(!exists(WEAR "/ledger.v1") && !exists(WEAR "/ledger.bak"));
     CHECK(!pthread_cond_destroy(&f.ctl.cond)); CHECK(!pthread_mutex_destroy(&f.ctl.mutex));
     CHECK(!nftw(f.root,remove_one,32,FTW_DEPTH|FTW_PHYS));
     printf("PASS phase1 %s swaps=%u disksize_writes=%u\n",name,f.swaps,f.disksize_writes);
@@ -761,8 +819,9 @@ static void phase1_case(const char *name) {
 int main(int argc, char **argv) {
     if (argc>=2 && !strcmp(argv[1],"--phase1")) {
         const char *cases[]={"boot-then-resume","paused-wait","ordinary","bad-pause",
-            "pause-symlink","bad-authority","pending","bad-ledger","bad-persist","backed",
-            "active-foreign","old-marker","wrong-device","wrong-label","existing-dm","disk-runtime",
+            "pause-symlink","bad-authority","pending","pending-new","pending-intent",
+            "missing-ledger","bad-ledger","exhausted-ledger","bad-persist","backed",
+            "active-foreign","old-marker","wrong-device","wrong-label","existing-dm","no-runtime-directory",
             "bind-race","attempt-not-replayed"};
         for (size_t i=0;i<sizeof cases/sizeof *cases;i++) phase1_case(cases[i]);
         return 0;

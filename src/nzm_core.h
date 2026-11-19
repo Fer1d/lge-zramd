@@ -4,6 +4,8 @@
 #include "planner.h"
 #include "nzm_io.h"
 #include "request_backend.h"
+#include "boot_state.h"
+#include "memory_budget.h"
 #include <stdio.h>
 /* Single owner only. Eventloop never accesses the worker's core or FDs. */
 struct nzm_runtime_control;
@@ -20,7 +22,9 @@ struct nzm_execution {
 };
 struct nzm_core {
   struct nzm_config config;
-  int runfd, wearfd, datafd;
+  int runfd, wearfd, datafd; /* runfd retained for legacy test ABI; production stays -1. */
+  struct nzm_boot_state boot_state;
+  char last_event[1024];
   enum nzm_watermark_state watermark, watermark_resume;
   int boot_completed;
   int timer_valid, no_progress;
@@ -39,6 +43,7 @@ struct nzm_core {
   int reserved, attempted, observed_before_valid, observed_after_valid;
   uint64_t observed_before, observed_after;
   struct nzm_execution execution;
+  struct nzm_memory_budget memory_budget; /* Object-local; never persisted. */
   int intent_owned;
   dev_t intent_dev;
   ino_t intent_ino;

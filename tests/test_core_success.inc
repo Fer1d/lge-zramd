@@ -1,5 +1,8 @@
-/* Included only by the syscall-fixture integration build. Production main,
- * core, IO, ledger and config are linked unmodified. */
+/* Explicit legacy-v1 scheduling regressions, never a production fallback.
+ * Current production phase1/status behavior has independent fixture cases. */
+#ifndef NZM_LEGACY_TEST
+#error "Historical scheduling fixtures require NZM_LEGACY_TEST"
+#endif
 #include <dirent.h>
 #include <linux/fs.h>
 #include "uapi/linux/zram.h"
@@ -66,13 +69,6 @@ static int low_data_space, query_fail_at, query_counter, identity_on_wait;
 static int bd_effect;
 static uint64_t attempted_effect;
 long test_sysconf(int name) { return name==_SC_PAGESIZE ? (long)cycle_page : sysconf(name); }
-int test_openat(int dirfd,const char *name,int flags,...) {
-  mode_t mode=0;
-  if(flags&O_CREAT) { va_list a;va_start(a,flags);mode=(mode_t)va_arg(a,int);va_end(a); }
-  if((flags&O_CREAT) && ((!strcmp(name,"pause") && fail_pause_create) ||
-      (!strcmp(name,"exec.intent") && intent_fault==1))) {errno=ENOSPC;return -1;}
-  return openat(dirfd,name,flags,mode);
-}
 static void request_effect(void) {
   if(!watermark_probe || (!bd_effect && !attempted_effect))return;
   char p[1024];path(p,"/sys/block/zram0/bd_stat");
@@ -121,12 +117,23 @@ static int legacy_module_config(struct nzm_core *c) {
   }
   return rc;
 }
+static char stage3_last_event[1200];
+/* Read persisted checkpoints through the production parser, never marker files. */
+static int checkpoint_present(const char *name) {
+  char p[1024]; path(p,"/mnt/vendor/persist/lge-zram-wear");
+  int fd=open(p,O_RDONLY|O_DIRECTORY|O_CLOEXEC); assert(fd>=0);
+  struct nzm_boot_state state; nzm_boot_init(&state);
+  assert(!nzm_boot_load(&state,fd));
+  int rc=nzm_boot_absent(&state,name); assert(!rc || rc==-EEXIST);
+  assert(!close(fd)); return rc==-EEXIST;
+}
 static int stage3_start(int daemon, int trusted) {
   struct nzm_core c;
   nzm_core_init(&c);
   c.trusted_boot_completed=trusted;
   int rc=legacy_module_config(&c);
   if (!rc) rc=daemon ? nzm_core_daemon(&c) : nzm_core_boot(&c);
+  snprintf(stage3_last_event,sizeof stage3_last_event,"%s",c.last_event);
   nzm_core_close(&c);
   return !!rc;
 }
@@ -461,21 +468,18 @@ int main(void) {
   assert(helper_ops[NZM_HELPER_QUERY] == before_queries &&
          writes == before_writes && opens_write == before_opens);
   char p[1024];
-  path(p, "/dev/lge-zram-manager/managed");
-  assert(!access(p, F_OK));
+  assert(checkpoint_present("managed"));
   boot_prop_unreadable=1;
   assert(stage3_start(1,0)==1);
   assert(boot_prop_reads==1 && boot_waits==1 && !request_calls);
-  path(p, "/dev/lge-zram-manager/vm-complete-completed");
-  assert(access(p,F_OK)<0);
+  assert(!checkpoint_present("vm-complete-completed"));
   assert(stage3_start(1,1) == 1);
   assert(boot_prop_reads==1 && boot_waits==1);
   boot_prop_unreadable=0; /* EINTR only after first successful cycle */
   assert(sleeps == 2 && swap_calls == 1 && helper_ops[NZM_HELPER_CREATE] == 1 &&
          request_calls == 1);
   assert(readnum("/proc/sys/vm/min_free_kbytes") == 200);
-  path(p, "/dev/lge-zram-manager/vm-complete-completed");
-  assert(!access(p, F_OK));
+  assert(checkpoint_present("vm-complete-completed"));
   path(p, "/sys/block/zram0/writeback");
   int f = open(p, O_RDONLY);
   assert(f >= 0);
@@ -519,8 +523,7 @@ int main(void) {
   unsigned old_requests = request_calls;
   assert(stage3_start(1,0) == 0);
   assert(request_calls == old_requests);
-  path(p, "/dev/lge-zram-manager/vm-complete-completed");
-  assert(!access(p, F_OK));
+  assert(checkpoint_present("vm-complete-completed"));
   /* DM scan read failure must not be mistaken for EOF / no existing mapping. */
   success_fixture();
   fail_readdir = 1;
@@ -528,14 +531,7 @@ int main(void) {
   assert(stage3_start(0,0) == 1);
   fail_readdir = 0;
   assert(helper_ops[NZM_HELPER_QUERY] == before_queries);
-  path(p, "/dev/lge-zram-manager/last-event");
-  f = open(p, O_RDONLY);
-  assert(f >= 0);
-  n = read(f, b, sizeof b - 1);
-  assert(n > 0);
-  b[n] = 0;
-  close(f);
-  assert(strstr(b, "cold_ownership") && strstr(b, "errno=5"));
+  assert(strstr(stage3_last_event,"startup_lock") && strstr(stage3_last_event,"errno=5"));
   /* Missing existing-data is bounded by monotonic time; invalid owner never
    * waits. */
   success_fixture();
@@ -609,60 +605,37 @@ int main(void) {
   file("/data/extm/owner", "foreign\n");
   data_sleeps = 0;
   assert(stage3_start(0,0) == 1 && data_sleeps == 0);
-  /* A rejected second instance must not mutate the owner's last-event bytes. */
+  /* Failed second owner cannot change startup evidence or owner's local event. */
   success_fixture();
   struct nzm_core owner;
-  nzm_core_init(&owner);
-  assert(!nzm_core_boot(&owner));
-  char snapshot[512], after_snapshot[512];
-  path(p, "/dev/lge-zram-manager/last-event");
-  f = open(p, O_RDONLY);
-  assert(f >= 0);
-  n = read(f, snapshot, sizeof snapshot);
-  assert(n > 0);
-  close(f);
-  assert(stage3_start(0,0) == 1);
-  f = open(p, O_RDONLY);
-  assert(f >= 0);
-  ssize_t after_n = read(f, after_snapshot, sizeof after_snapshot);
-  close(f);
-  assert(after_n == n && !memcmp(snapshot, after_snapshot, (size_t)n));
+  nzm_core_init(&owner); assert(!nzm_core_boot(&owner));
+  char snapshot[1200]; snprintf(snapshot,sizeof snapshot,"%s",owner.last_event);
+  unsigned checkpoint_bits=owner.boot_state.present;
+  int checkpoint_writes=writes;
+  assert(stage3_start(0,0)==1);
+  assert(writes==checkpoint_writes && owner.boot_state.present==checkpoint_bits);
+  assert(!strcmp(snapshot,owner.last_event));
   nzm_core_close(&owner);
-  /* Writeback EIO is the final snapshot cause, with precharge/attempt and pause
-   * result. */
-  success_fixture();
-  sleeps = 0;
-  fail_wb = 1;
-  assert(stage3_start(1,0) == 1);
-  fail_wb = 0;
-  path(p, "/dev/lge-zram-manager/last-event");
-  f = open(p, O_RDONLY);
-  assert(f >= 0);
-  n = read(f, snapshot, sizeof snapshot - 1);
-  assert(n > 0);
-  snapshot[n] = 0;
-  close(f);
-  assert(strstr(snapshot, "stage=attempt_uncertain_no_refund errno=5"));
-  assert(strstr(snapshot, "reserved=1 attempted=1") &&
-         strstr(snapshot, "pause_errno=0"));
-  /* Snapshot failures stay explicitly unknown; they never mask the actual
-   * cause. */
-  for (int failure = 0; failure < 2; failure++) {
-    success_fixture();
-    nzm_core_init(&owner);
-    assert(!nzm_core_boot(&owner));
-    if (!failure)
-      fail_snapshot_short = 1;
-    else
-      fail_snapshot_sync = 1;
-    owner.reserved = owner.attempted =
-        1; /* preserved diagnostic state under an owned lock */
-    assert(!nzm_core_pause(&owner, "snapshot_failure_test"));
-    assert(owner.snapshot_errno == EIO);
-    fail_snapshot_short = fail_snapshot_sync = 0;
-    nzm_core_close(&owner);
+  /* Writeback EIO remains the final local cause, with precharge and attempt. */
+  success_fixture(); sleeps=0; fail_wb=1;
+  assert(stage3_start(1,0)==1); fail_wb=0;
+  assert(strstr(stage3_last_event,"stage=attempt_uncertain_no_refund errno=5"));
+  assert(strstr(stage3_last_event,"reserved=1 attempted=1"));
+  /* Logging is process-local: obsolete snapshot I/O failures cannot affect
+   * pause, overwrite the error cause, or create a runtime filesystem. */
+  for(int failure=0;failure<2;failure++) {
+    success_fixture(); nzm_core_init(&owner); assert(!nzm_core_boot(&owner));
+    fail_snapshot_short=!failure; fail_snapshot_sync=failure;
+    owner.reserved=owner.attempted=1;
+    assert(!nzm_core_pause(&owner,"snapshot_failure_test"));
+    assert(!owner.snapshot_errno);
+    assert(strstr(owner.last_event,"snapshot_failure_test") &&
+           strstr(owner.last_event,"reserved=1 attempted=1"));
+    path(p,"/dev/lge-zram-manager/last-event");
+    assert(access(p,F_OK)<0 && errno==ENOENT);
+    fail_snapshot_short=fail_snapshot_sync=0; nzm_core_close(&owner);
   }
-  /* Production-cycle policy regressions: real core/planner/ledger/IO. */
+  /* Explicit legacy-v1 cycle policy regressions: real core/planner/ledger/IO. */
   watermark_probe=1;
   const char *powers[]={"Charging\n","Full\n","Discharging\n","Not charging\n"};
   for(int screen=0;screen<2;screen++)for(int power=0;power<4;power++) {
@@ -679,7 +652,7 @@ int main(void) {
     assert(ledger_generation()==1);
     nzm_core_close(&owner);
   }
-  puts("PASS production screen 0/4 x Charging/Full/Discharging/Not charging: batch/idle/ledger/limit");
+  puts("PASS historical legacy-v1 screen 0/4 x Charging/Full/Discharging/Not charging: batch/idle/ledger/limit");
   for(int bad=0;bad<4;bad++) {
     success_fixture();nzm_core_init(&owner);assert(!nzm_core_boot(&owner));owner.boot_completed=1;
     if(bad==0)file("/sys/class/backlight/panel0-backlight/bl_power","1\n");
@@ -778,7 +751,7 @@ int main(void) {
     }
     nzm_core_close(&owner);
   }
-  puts("PASS production actual-attempt clocks 29/30,119/120, cross-power, conservative switches, time eligibility loss, no time relabel");
+  puts("PASS historical legacy-v1 actual-attempt clocks 29/30,119/120, cross-power, conservative switches, time eligibility loss, no time relabel");
   /* Original 8MiB blocked plan cannot be diluted by a new 2MiB policy,
    * power changes, low crossing, or elapsed-only retry. */
   success_fixture();nzm_core_init(&owner);assert(!nzm_core_boot(&owner));owner.boot_completed=1;
@@ -822,7 +795,7 @@ int main(void) {
   remove_file("/mnt/vendor/persist/lge-zram-wear/ledger");rq=request_calls;
   assert(nzm_core_cycle(&owner)<0 && request_calls==rq && !owner.reserved);
   nzm_core_close(&owner);watermark_probe=0;
-  puts("PASS production shared NO_PROGRESS original evidence, low/power/shrink resistance, 4/16/64K plan/ledger/limit, identity and ledger IO faults");
+  puts("PASS historical legacy-v1 shared NO_PROGRESS original evidence, low/power/shrink resistance, 4/16/64K plan/ledger/limit, identity and ledger IO faults");
   /* Frozen historical profiles explicitly constructed after the live loader.
    * Retired policy keys in files must never reactivate production scheduling. */
   watermark_probe=1;advance_idle_clock=1;bd_effect=1;

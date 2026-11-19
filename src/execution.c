@@ -130,7 +130,7 @@ int nzm_execution_select(struct nzm_core *c) {
       e->identity=s->identity;
       e->page_size=s->page_size;
       e->disksize_bytes=disk;
-      e->next_request_id=1; /* Independent of ledger generation/clock/counters. */
+      /* Request numbering belongs to the controller object's lifetime. */
       e->backend=RB_BACKEND_REQUEST;
     }
   }

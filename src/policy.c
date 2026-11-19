@@ -22,19 +22,26 @@
 #include NZM_CORE_ADAPTER
 #endif
 
-/* Phase 1 never authorizes a physical backend. A verified pause dominates
- * persistent pending records; without pause require normal wear validation.
- * Neither branch provisions, repairs, clears, or reserves anything. */
+/* Validate authority/pause and fence unresolved execution/transaction evidence.
+ * Historical ledgers are not production budget authority: never open, parse,
+ * migrate, repair or reserve them. A fence disables demand, not RAM swap. */
 int nzm_phase1_policy(struct nzm_core *c, int *paused) {
   int rc = nzm_pause_verified(c, paused);
   if (rc || *paused)
     return rc;
-  struct nzm_ledger l = {0};
-  rc = nzm_wear(c, &l);
-  nzm_ledger_free(&l);
-  return rc;
+  /* Unknown execution and ledger transaction evidence disables demand, not
+   * basic swap. Do not parse, migrate, clear, or replay any pending state. */
+  const char *pending[] = {"exec.intent", "ledger.new", "ledger.txn"};
+  for (size_t i = 0; i < sizeof pending / sizeof pending[0]; ++i) {
+    rc = nzm_absent(c->wearfd, pending[i]);
+    if (rc == -EEXIST) { *paused = 1; return 0; }
+    if (rc) return rc;
+  }
+  return 0;
 }
 
+#ifdef NZM_LEGACY_TEST
+/* Explicit historical scheduling API; not linked into production. */
 int nzm_core_workload(const struct nzm_config *cfg, uint64_t page,
                       const uint64_t mm[10], const uint64_t bd[3],
                       uint64_t *upper) {
@@ -96,3 +103,4 @@ int nzm_sample_plan(struct nzm_core *c, struct nzm_cycle_policy *policy, struct 
   }
   return 0;
 }
+#endif

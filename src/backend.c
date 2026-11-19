@@ -24,6 +24,7 @@
 
 struct recovery_state { struct nzm_core *core; int data; };
 static int wear_authority(struct nzm_core *c) {
+  if (c->boot_state.authority_fd >= 0) return nzm_core_authority(c);
   static const char authority[] = "extm-wear-v1\n";
   char auth[sizeof authority - 1];
   size_t len;
@@ -57,6 +58,8 @@ int nzm_pause_verified(struct nzm_core *c, int *paused) {
   *paused = 1;
   return 0;
 }
+#ifdef NZM_LEGACY_TEST
+/* Historical v1 scheduling fixture only; never a production fallback. */
 int nzm_wear(struct nzm_core *c, struct nzm_ledger *l) {
   int rc = wear_authority(c);
   if (rc)
@@ -77,6 +80,7 @@ int nzm_wear(struct nzm_core *c, struct nzm_ledger *l) {
   free(b);
   return rc;
 }
+#endif
 static int data_open(struct nzm_core *c, int allow_create) {
   (void)allow_create; /* Fresh-data provisioning requires a separate
                          policy-reviewed helper. */
@@ -118,13 +122,15 @@ static int recovery_verify(void *arg) {
     if(d<0)return d;
     rc=same_inode(d,state->data);close(d);if(rc)return rc;
   }
-  struct nzm_ledger l={0};
-  if(!rc)rc=nzm_wear(c,&l);
-  nzm_ledger_free(&l);
+  /* Revalidate authorization and unresolved evidence, never historical budget.
+   * Recovery must not bypass a pause even if startup was previously allowed. */
+  int paused = 0;
+  if(!rc)rc=nzm_phase1_policy(c,&paused);
+  if(!rc && paused)rc=-ECANCELED;
   if(!rc)rc=nzm_cold();
   if(!rc)rc=nzm_no_mapping();
-  if(!rc)rc=nzm_absent(c->runfd,"acquire-intent");
-  if(!rc)rc=nzm_absent(c->runfd,"bootstrap-result");
+  if(!rc)rc=nzm_state_absent(c,"acquire-intent");
+  if(!rc)rc=nzm_state_absent(c,"bootstrap-result");
   return rc;
 }
 static int recovery_request(void *arg) {
@@ -230,7 +236,7 @@ int nzm_managed(struct nzm_core *c) {
   int rc = nzm_identity(c, &id);
   if (rc)
     return rc;
-  if ((rc = nzm_text(c->runfd, "managed", RCTX, b, sizeof b)))
+  if ((rc = nzm_state_text(c, "managed", b, sizeof b)))
     return rc;
   unsigned ma, mi;
   uint64_t fs, ino, bytes;

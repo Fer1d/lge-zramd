@@ -144,8 +144,17 @@ int nzm_create_text(int fd, const char *name, const char *ctx,
     rc = -errno;
   return rc;
 }
+int nzm_core_authority(struct nzm_core *c) {
+  return nzm_boot_assert(&c->boot_state);
+}
+int nzm_state_absent(struct nzm_core *c, const char *name) {
+  return nzm_boot_absent(&c->boot_state, name);
+}
+int nzm_state_text(struct nzm_core *c, const char *name, char *b, size_t cap) {
+  return nzm_boot_text(&c->boot_state, name, b, cap);
+}
 int nzm_mark(struct nzm_core *c, const char *name, const char *s) {
-  return nzm_create_text(c->runfd, name, RCTX, s);
+  return nzm_boot_mark(&c->boot_state, name, s);
 }
 int nzm_put(const char *p, const char *s) {
   int fd = open(p, O_WRONLY | O_NOFOLLOW | O_CLOEXEC);

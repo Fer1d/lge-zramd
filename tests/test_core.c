@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "nzm_core.h"
+#include "nzm_internal.h"
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -10,7 +11,7 @@
 #include <unistd.h>
 static char root[256];
 static int writes, opens_write, deny_vm, wrong_data, wrong_owner, short_write;
-static int config_fault;
+static int config_fault, forbid_ledger_io;
 #ifdef NZM_INTEGRATION
 static void verify_precharge_at_request(void);
 static int fail_wb, fail_snapshot_short, fail_snapshot_sync, fail_attempt_open;
@@ -37,6 +38,8 @@ static void fdpath(int fd, char *p, size_t cap) {
   p[n] = 0;
 }
 int test_open(const char *p, int flags, ...) {
+  if (forbid_ledger_io)
+    assert(strcmp(p, WEAR "/ledger"));
   mode_t mode = 0;
   if (flags & O_CREAT) {
     va_list a;
@@ -61,6 +64,21 @@ int test_open(const char *p, int flags, ...) {
       !strcmp(p+strlen(p)-10,"/writeback")) {errno=EACCES;return -1;}
 #endif
   return open(p, flags, mode);
+}
+int test_openat(int dirfd, const char *name, int flags, ...) {
+  if (forbid_ledger_io) assert(strncmp(name, "ledger", 6));
+  mode_t mode = 0;
+  if (flags & O_CREAT) {
+    va_list args; va_start(args, flags);
+    mode = (mode_t)va_arg(args, int); va_end(args);
+  }
+#ifdef NZM_INTEGRATION
+  if ((flags & O_CREAT) && ((!strcmp(name,"pause") && fail_pause_create) ||
+      (!strcmp(name,"exec.intent") && intent_fault==1))) {
+    errno=ENOSPC; return -1;
+  }
+#endif
+  return openat(dirfd, name, flags, mode);
 }
 int test_fstat(int fd, struct stat *s) {
   int r = fstat(fd, s);
@@ -110,7 +128,7 @@ ssize_t test_xattr(int fd, const char *name, void *buf, size_t cap) {
     type = "extm_wear_dir";
     if (strstr(p, "/authority"))
       type = "extm_wear_authority";
-    else if (strstr(p, "/ledger") || strstr(p,"/exec.intent"))
+    else if (strstr(p, "/ledger") || strstr(p,"/exec.intent") || strstr(p,"/boot-state"))
       type = "extm_wear_ledger";
     else if (strstr(p, "/pause"))
       type = "extm_wear_pause";
@@ -178,11 +196,13 @@ static void file(const char *s, const char *value) {
   assert(write(fd, value, strlen(value)) == (ssize_t)strlen(value));
   assert(!close(fd));
 }
+#ifdef NZM_INTEGRATION
 static void remove_file(const char *s) {
   char p[1024];
   path(p, s);
   assert(!unlink(p));
 }
+#endif
 static uint64_t readnum(const char *s) {
   char p[1024], b[64];
   path(p, s);
@@ -233,9 +253,15 @@ static void setup(void) {
 static void init(struct nzm_core *c) {
   nzm_core_init(c);
   char p[1024];
-  path(p, "/dev/lge-zram-manager");
-  c->runfd = open(p, O_RDONLY | O_DIRECTORY);
-  assert(c->runfd >= 0);
+  path(p, "/mnt/vendor/persist/lge-zram-wear");
+  c->wearfd = open(p, O_RDONLY | O_DIRECTORY);
+  assert(c->wearfd >= 0);
+  strcpy(c->boot, "01234567-89ab-cdef-0123-456789abcdef");
+  assert(!nzm_boot_lock(&c->boot_state, c->wearfd));
+  c->lock.fd = c->boot_state.authority_fd;
+  int rc = nzm_boot_load(&c->boot_state, c->wearfd);
+  if (rc == -ENOENT) assert(!nzm_boot_reset(&c->boot_state, c->boot, "1"));
+  else assert(!rc);
 }
 #ifdef NZM_INTEGRATION
 #include "test_core_success.inc"
@@ -254,13 +280,16 @@ int main(void) {
   assert(readnum("/proc/sys/vm/min_free_kbytes") == 200);
   w = writes;
   assert(nzm_core_vm(&c, 1) == 0 && writes == w);
-  remove_file("/dev/lge-zram-manager/vm-complete-completed");
+  /* A durable attempted-only checkpoint must never replay this VM pass. */
+  c.boot_state.present &= ~(1u << 4);
   assert(nzm_core_vm(&c, 1) < 0 &&
          writes == w); /* prior intent never retries */
   nzm_core_close(&c);
   init(&c);
   /* Direct provisioning without the startup owner lock is now forbidden.
    * Filesystem recovery positives/faults are covered in test_recovery.c. */
+  nzm_boot_close(&c.boot_state);
+  c.lock.fd = -1;
   assert(nzm_core_provision(&c) == -EPERM);
   FILE *out = tmpfile();
   assert(out);
@@ -287,6 +316,56 @@ int main(void) {
   for (size_t i=0; i<sizeof snapshot_fields/sizeof snapshot_fields[0]; ++i)
     assert(strstr(snapshot, snapshot_fields[i]));
   fclose(out);
+  /* Fresh CLI status verifies authority read-only, but never samples historical
+   * ledgers or presents its own fresh local budget as running-daemon history. */
+  dir("/proc/sys/kernel",0755); dir("/proc/sys/kernel/random",0755);
+  file("/proc/sys/kernel/random/boot_id","01234567-89ab-cdef-0123-456789abcdef\n");
+  const char *old_ledgers[] = {NULL, "corrupt legacy ledger\n",
+      "wear-v1 1 0 65536\n0 65536\n", "wear-v3 untrusted pending data\n"};
+  char ledger_path[1024]; path(ledger_path, WEAR "/ledger");
+  for (size_t i=0; i<sizeof old_ledgers/sizeof *old_ledgers; i++) {
+    if (old_ledgers[i]) file(WEAR "/ledger",old_ledgers[i]);
+    else assert(!unlink(ledger_path));
+    struct nzm_core status_core; nzm_core_init(&status_core);
+    out=tmpfile(); assert(out); w=writes; ow=opens_write;
+    forbid_ledger_io=1;
+    assert(!nzm_core_status(&status_core,out));
+    forbid_ledger_io=0;
+    assert(writes==w && opens_write==ow && status_core.wearfd==-1 &&
+           status_core.boot_state.authority_fd==-1);
+    rewind(out); snapshot_len=fread(snapshot,1,sizeof snapshot-1,out); snapshot[snapshot_len]=0;
+    assert(strstr(snapshot,"budget_scope=process_local reset=controller_object_restart running_daemon_budget=unknown"));
+    assert(strstr(snapshot,"historical_ledger=ignored"));
+    assert(strstr(snapshot,"accounting=submitted_when_known unknown=full_reservation"));
+    assert(strstr(snapshot,"demand_authority=valid"));
+    assert(!strstr(snapshot,"used_kib=") && !strstr(snapshot,"available_kib="));
+    assert(!strstr(snapshot,"migration_required=") && !strstr(snapshot,"pending_reserved_kib="));
+    assert(strstr(snapshot,"pool_policy=unknown") && strstr(snapshot,"pool_demand=unknown"));
+    fclose(out); nzm_core_close(&status_core);
+    if (!old_ledgers[i]) assert(access(ledger_path,F_OK)<0 && errno==ENOENT);
+    else {
+      FILE *ledger_file=fopen(ledger_path,"r"); assert(ledger_file);
+      char original[128]; size_t n=fread(original,1,sizeof original-1,ledger_file);
+      original[n]=0; assert(!fclose(ledger_file)); assert(!strcmp(original,old_ledgers[i]));
+    }
+  }
+  /* Presence-only fences do not parse/consume pending evidence or require an
+   * old ledger. They pause demand without rejecting normal RAM activation. */
+  const char *fences[] = {"exec.intent", "ledger.new", "ledger.txn"};
+  for (size_t i=0; i<sizeof fences/sizeof *fences; i++) {
+    char leaf[128], full[1024]; snprintf(leaf,sizeof leaf,WEAR "/%s",fences[i]);
+    file(leaf,"unexamined evidence\n"); path(full,leaf);
+    int paused=0; w=writes; ow=opens_write; forbid_ledger_io=1;
+    assert(!nzm_phase1_policy(&c,&paused) && paused);
+    out=tmpfile(); assert(out); assert(!nzm_core_status(&c,out));
+    forbid_ledger_io=0;
+    assert(w==writes && ow==opens_write);
+    rewind(out); snapshot_len=fread(snapshot,1,sizeof snapshot-1,out); snapshot[snapshot_len]=0;
+    assert(strstr(snapshot,"demand_authority=blocked"));
+    assert(!strstr(snapshot,"used_kib=")); assert(!fclose(out));
+    assert(!unlink(full));
+  }
+  file(WEAR "/ledger","wear-v1 0 0 0\n");
   struct nzm_config cfg;
   nzm_config_default(&cfg);
   uint64_t mm[10] =

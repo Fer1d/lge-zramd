@@ -41,6 +41,50 @@ int nzm_demand_read(int fd, struct nzm_demand_view *out) {
   text[len]=0;return nzm_demand_parse(text,out);
 }
 
+static uint64_t deadline_add(uint64_t now,uint64_t delta) {
+  return now>UINT64_MAX-delta ? UINT64_MAX : now+delta;
+}
+struct nzm_demand_decision nzm_demand_decide(struct nzm_demand_schedule *s,
+    const struct nzm_demand_view *v,uint64_t now) {
+  struct nzm_demand_decision d={NZM_DEMAND_WAIT,0};
+  if(!s || !v) {d.action=NZM_DEMAND_FATAL;return d;}
+  if(s->fatal) {d.action=NZM_DEMAND_FATAL;return d;}
+  if(s->sequence!=v->sequence) {
+    s->sequence=v->sequence;s->successes=0;
+    /* Age refreshes advance sequence, but never bypass existing deadlines. */
+  }
+  if(!v->active || !v->enabled || !v->initialized || !v->backing)return d;
+  uint64_t wait=s->retry_ns>s->budget_ns ? s->retry_ns : s->budget_ns;
+  if(wait==UINT64_MAX || wait>now) {
+    if(!d.deadline_ns || wait<d.deadline_ns)d.deadline_ns=wait;
+    return d;
+  }
+  if(s->successes>=4)return d;
+  d.action=NZM_DEMAND_EXECUTE;return d;
+}
+void nzm_demand_complete(struct nzm_demand_schedule *s,uint64_t now,
+    uint64_t age,int rc,int halted,int known,uint64_t installed,uint64_t budget) {
+  if(!s)return;
+  if(halted || (rc && rc!=-EAGAIN && rc!=-ESTALE && rc!=-EDQUOT)) {s->fatal=1;return;}
+  s->budget_ns=0;
+  if(rc==-EDQUOT) {
+    s->retry_ns=0;
+    /* Expiry can pass during EXEC/closure. Reevaluate the budget on the next
+     * bounded read, not a fatal latch or an immediate EXEC busy loop. */
+    if(!budget || budget<=now) s->retry_ns=deadline_add(now,UINT64_C(1000000000));
+    else s->budget_ns=budget;
+    return;
+  }
+  if(!rc && known && installed) {
+    s->successes++;s->zero_progress=0;s->retry_ns=0;return;
+  }
+  uint64_t delay=age>60 ? age : 60;
+  if(delay>1800)delay=1800;
+  for(unsigned i=0;i<s->zero_progress && delay<1800;i++)delay=delay>900 ? 1800 : delay*2;
+  if(s->zero_progress<32)s->zero_progress++;
+  s->retry_ns=deadline_add(now,delay*UINT64_C(1000000000));
+}
+
 /* The runtime adapter is deliberately not enabled in an unqualified policy
  * image. The real consumer is compiled by the candidate fixture below. */
 #ifndef NZM_DEMAND_RUNTIME_QUALIFIED
@@ -50,6 +94,7 @@ int nzm_demand_watch(struct nzm_core *c) {
 }
 #else
 #include "demand_exec.h"
+static int watch_now(uint64_t *now) {return nzm_memory_now(now);}
 static volatile sig_atomic_t demand_stop;
 static void stop_signal(int sig) {(void)sig; demand_stop=1;}
 int nzm_demand_watch(struct nzm_core *c) {
@@ -69,28 +114,36 @@ int nzm_demand_watch(struct nzm_core *c) {
   struct sigaction action={0};action.sa_handler=stop_signal;
   if(!rc && (sigemptyset(&action.sa_mask)||sigaction(SIGTERM,&action,NULL)||sigaction(SIGINT,&action,NULL)))rc=-errno;
   if(!rc && !demand_stop)rc=nzm_put(Z "pool_policy",config);
-  uint64_t seen=0;unsigned episode=0;int attempted=0;
-  struct nzm_demand_exec_state exec_state={.next_request_id=1};
+  struct nzm_demand_schedule schedule={0};
+  struct nzm_demand_exec_state exec_state={0};
   while(!rc && !demand_stop) {
     struct nzm_demand_view v;
     rc=nzm_demand_read(fd,&v);if(rc)break;
     if(v.low_mib!=c->config.pool_low_mib || v.high_mib!=c->config.pool_high_mib ||
        v.min_age_seconds!=c->config.cold_age_seconds || !v.enabled || !v.initialized || !v.backing){rc=-ESTALE;break;}
     if((rc=nzm_pause_verified(c,&paused)) || paused){if(!rc)rc=-ECANCELED;break;}
-    if(v.active && (!attempted || v.sequence!=seen)) {
-      if(seen!=v.sequence)episode=0;
-      seen=v.sequence;attempted=1;
+    uint64_t now;
+    rc=watch_now(&now);if(rc)break;
+    struct nzm_demand_decision decision=nzm_demand_decide(&schedule,&v,now);
+    if(decision.action==NZM_DEMAND_FATAL) {rc=-EIO;break;}
+    if(decision.action==NZM_DEMAND_EXECUTE) {
       exec_state.expected_sequence=v.sequence;
-      rc=nzm_core_demand_exec(c,&exec_state,NULL,NULL);
-      if(!rc && exec_state.known && exec_state.reply.exec.installed_pages && ++episode<4){
-        attempted=0; /* Bounded continuation while the same demand remains high. */
-      }
-      if(rc==-EAGAIN || rc==-ESTALE || rc==-EDQUOT)rc=0;
-      if(rc || exec_state.halted)break;
+      int result=nzm_core_demand_exec(c,&exec_state,NULL,NULL);
+      rc=watch_now(&now);
+      if(rc)break;
+      nzm_demand_complete(&schedule,now,v.min_age_seconds,result,exec_state.halted,
+          exec_state.known,exec_state.reply.exec.installed_pages,exec_state.budget_deadline_ns);
+      if(schedule.fatal) {rc=result ? result : -EIO;break;}
       continue;
     }
+    int timeout=1000; /* Bounded read resync, not authorization or persistence. */
+    if(decision.deadline_ns && decision.deadline_ns>now) {
+      uint64_t delta=decision.deadline_ns-now;
+      uint64_t ms=delta/1000000+(delta%1000000!=0);
+      if(ms<(uint64_t)timeout)timeout=(int)ms;
+    }
     struct pollfd pollfd={.fd=fd,.events=POLLPRI|POLLERR};
-    int ready=poll(&pollfd,1,30000); /* Read-only health resync, never a trigger. */
+    int ready=poll(&pollfd,1,timeout);
     if(ready<0){if(errno==EINTR)continue;rc=-errno;break;}
     if(pollfd.revents&(POLLHUP|POLLNVAL)){rc=-ENODEV;break;}
   }
