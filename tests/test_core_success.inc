@@ -21,14 +21,14 @@ int test_unlinkat(int fd,const char *name,int flags) {
 int test_fsync(int fd) {
   char p[1024];
   fdpath(fd, p, sizeof p);
-  if(intent_retire_sync && !strcmp(p+strlen(root),"/mnt/vendor/persist/lge-zram-wear")) {
+  if(intent_retire_sync && !strcmp(p+strlen(root),"/data/vendor/extm/state")) {
     intent_retire_sync=0;
     if(intent_fault==6) {errno=EIO;return -1;}
   }
   if(strstr(p,"/exec.intent")) {
     intent_syncs++;intent_dirsync=1;
     if(intent_fault==3) {errno=EIO;return -1;}
-  } else if(intent_dirsync && !strcmp(p+strlen(root),"/mnt/vendor/persist/lge-zram-wear")) {
+  } else if(intent_dirsync && !strcmp(p+strlen(root),"/data/vendor/extm/state")) {
     intent_dirsync=0;
     if(intent_fault==4) {errno=EIO;return -1;}
   }
@@ -83,7 +83,7 @@ static uint64_t expected_charge=4096;
 static unsigned chunk_calls;
 static void verify_precharge_at_request(void) {
   char p[1024], b[4096];
-  path(p, "/mnt/vendor/persist/lge-zram-wear/ledger");
+  path(p, "/data/vendor/extm/state/ledger");
   int f = open(p, O_RDONLY);
   assert(f >= 0);
   ssize_t n = read(f, b, sizeof b - 1);
@@ -95,9 +95,9 @@ static void verify_precharge_at_request(void) {
   if(watermark_probe)assert(l.count && l.records[l.count-1].kib==expected_charge);
   else assert(l.generation == 1 && l.cumulative == expected_charge && l.count == 1);
   nzm_ledger_free(&l);
-  path(p, "/mnt/vendor/persist/lge-zram-wear/ledger.txn");
+  path(p, "/data/vendor/extm/state/ledger.txn");
   assert(access(p, F_OK) < 0 && errno == ENOENT);
-  path(p, "/mnt/vendor/persist/lge-zram-wear/ledger.new");
+  path(p, "/data/vendor/extm/state/ledger.new");
   assert(access(p, F_OK) < 0 && errno == ENOENT);
   request_calls++;
 }
@@ -120,7 +120,7 @@ static int legacy_module_config(struct nzm_core *c) {
 static char stage3_last_event[1200];
 /* Read persisted checkpoints through the production parser, never marker files. */
 static int checkpoint_present(const char *name) {
-  char p[1024]; path(p,"/mnt/vendor/persist/lge-zram-wear");
+  char p[1024]; path(p,"/data/vendor/extm/state");
   int fd=open(p,O_RDONLY|O_DIRECTORY|O_CLOEXEC); assert(fd>=0);
   struct nzm_boot_state state; nzm_boot_init(&state);
   assert(!nzm_boot_load(&state,fd));
@@ -139,36 +139,9 @@ static int stage3_start(int daemon, int trusted) {
 }
 static uid_t command_euid;
 uid_t test_geteuid(void) { return command_euid; }
-static int provision_mode, provision_sets, provision_polls, provision_sleeps;
-static const char *crypto_type="";
-static char provision_ack[92];
 static int boot_prop_unreadable, boot_prop_reads, boot_waits;
-int __system_property_set(const char *name, const char *value) {
-  assert(!strcmp(name,"sys.extm.provision.request"));
-  assert(!strcmp(value,"01234567-89ab-cdef-0123-456789abcdef"));
-  provision_sets++;
-  if(!provision_mode)return -1;
-  if(provision_mode==1)dir("/data/extm",0700);
-  /* 4: delayed ack+mkdir, 5: no ack, 6: attempted mkdir fails,
-   * 7: ack would arrive only after the timeout boundary. */
-  if(provision_mode==4 || provision_mode==5 || provision_mode==7)return 0;
-  strcpy(provision_ack,provision_mode==2?"unknown":value);
-  return 0;
-}
 int __system_property_get(const char *name, char *value) {
-  if(!strcmp(name,"ro.crypto.type")) { strcpy(value,crypto_type); return (int)strlen(value); }
-  if(!strcmp(name,"sys.extm.provision.request")) { strcpy(value,provision_mode==3?"stale":""); return (int)strlen(value); }
-  if(!strcmp(name,"sys.extm.provision.ack")) {
-    if(provision_sets) {
-      provision_polls++;
-      if((provision_mode==4 && provision_polls==4) ||
-         (provision_mode==7 && provision_polls==5)) {
-        dir("/data/extm",0700);
-        strcpy(provision_ack,"01234567-89ab-cdef-0123-456789abcdef");
-      }
-    }
-    strcpy(value,provision_ack); return (int)strlen(value);
-  }
+  if(!strcmp(name,"ro.crypto.type")) { value[0]=0; return 0; }
   assert(!strcmp(name, "sys.boot_completed"));
   boot_prop_reads++;
   if (boot_prop_unreadable) { value[0]=0; return 0; }
@@ -227,7 +200,7 @@ int test_helper_call(enum nzm_helper_op op,
   run->attempted = run->reaped = 1;
   if (op == NZM_HELPER_PREPARE) {
     char p[1024];
-    path(p, "/data/extm/file");
+    path(p, "/data/vendor/extm/file");
     int f = open(p, O_WRONLY | O_CREAT | O_EXCL, 0600);
     assert(f >= 0);
     assert(!ftruncate(f, (off_t)id->bytes));
@@ -274,11 +247,6 @@ int test_sleep(const struct timespec *t, struct timespec *left) {
     return 0;
   }
   if(t->tv_sec==5) { boot_waits++; errno=EINTR; return -1; }
-  if(t->tv_sec==0 && t->tv_nsec==100000000) {
-    provision_sleeps++;
-    monotonic_tick++; /* bounded simulated time, no real wait */
-    return 0;
-  }
   if (timing_probe == 2) {
     assert(t->tv_sec == (chunk_calls++ ? 1 : 86400)); return 0;
   }
@@ -299,8 +267,7 @@ int test_sleep(const struct timespec *t, struct timespec *left) {
 }
 static void success_fixture(void) {
   setup();
-  dir("/data/extm", 0700);
-  file("/data/extm/owner", "extm-dm-owner-v1\n");
+  file("/data/vendor/extm/owner", "extm-dm-owner-v1\n");
   dir("/vendor", 0755);
   dir("/vendor/etc", 0755);
   file("/vendor/etc/lge-zram.conf", "idle_observation_seconds=301\nsample_interval_seconds=503\nwait_log_interval_seconds=709\nwatermark_charging_batch_mib=4\nwatermark_charging_idle_observation_seconds=301\nwatermark_battery_idle_observation_seconds=301\nwatermark_charging_min_interval_seconds=0\n");
@@ -334,7 +301,7 @@ static void success_fixture(void) {
   file("/sys/block/zram0/writeback", "");
 }
 static uint64_t ledger_generation(void) {
-  char p[1024],b[4096];path(p,"/mnt/vendor/persist/lge-zram-wear/ledger");
+  char p[1024],b[4096];path(p,"/data/vendor/extm/state/ledger");
   FILE *f=fopen(p,"r");assert(f);
   size_t n=fread(b,1,sizeof b,f);assert(!ferror(f));fclose(f);
   struct nzm_ledger l={0};assert(!nzm_ledger_parse(b,n,(uint64_t)time(NULL),&l));
@@ -419,7 +386,7 @@ int main(void) {
   char ledger_text[128];
   unsigned long long now = (unsigned long long)time(NULL);
   snprintf(ledger_text, sizeof ledger_text, "wear-v1 1 %llu 65536\n%llu 65536\n", now, now);
-  file("/mnt/vendor/persist/lge-zram-wear/ledger", ledger_text);
+  file("/data/vendor/extm/state/ledger", ledger_text);
   struct nzm_core timed;
   nzm_core_init(&timed);
   assert(!legacy_module_config(&timed));
@@ -454,7 +421,7 @@ int main(void) {
   assert(!nzm_core_cycle(&timed) && timed.last_wait_log==1);
   nzm_core_close(&timed);
   timing_probe = 0;
-  file("/mnt/vendor/persist/lge-zram-wear/ledger", "wear-v1 0 0 0\n");
+  file("/data/vendor/extm/state/ledger", "wear-v1 0 0 0\n");
   puts("PASS actual independent inner=301 outer=503 log=709 (log at 1000/1709, suppressed 1708)");
   char *check[] = {"native-zram-manager", "check-config", NULL};
   int check_writes=writes, check_opens=opens_write;
@@ -489,7 +456,7 @@ int main(void) {
   b[n] = 0;
   close(f);
   assert(!strcmp(b, "idle 1024 1\n"));
-  path(p, "/mnt/vendor/persist/lge-zram-wear/ledger");
+  path(p, "/data/vendor/extm/state/ledger");
   f = open(p, O_RDONLY);
   assert(f >= 0);
   n = read(f, b, sizeof b - 1);
@@ -502,18 +469,18 @@ int main(void) {
   nzm_ledger_free(&l);
   before_queries = helper_ops[NZM_HELPER_QUERY];
   before_writes = writes;
-  file("/mnt/vendor/persist/lge-zram-wear/ledger.txn", "nzm-ledger-txn-v1\n");
+  file("/data/vendor/extm/state/ledger.txn", "nzm-ledger-txn-v1\n");
   assert(nzm_entry(2, status) == 0);
   assert(helper_ops[NZM_HELPER_QUERY] == before_queries &&
          writes == before_writes);
   assert(stage3_start(1,0) == 1);
   assert(request_calls == 1 && helper_ops[NZM_HELPER_QUERY] == before_queries);
   /* Operator pause remains available with missing or malformed config. */
-  remove_file("/mnt/vendor/persist/lge-zram-wear/pause");
+  remove_file("/data/vendor/extm/state/pause");
   file("/vendor/etc/lge-zram.conf", "not=config\n");
   char *pause_cmd[] = {"native-zram-manager", "pause", "--confirmed", NULL};
   assert(nzm_entry(3, pause_cmd) == 0);
-  remove_file("/mnt/vendor/persist/lge-zram-wear/pause");
+  remove_file("/data/vendor/extm/state/pause");
   remove_file("/vendor/etc/lge-zram.conf");
   assert(nzm_entry(3, pause_cmd) == 0);
   /* Disabled writeback still completes second VM verification, with no request.
@@ -532,61 +499,33 @@ int main(void) {
   fail_readdir = 0;
   assert(helper_ops[NZM_HELPER_QUERY] == before_queries);
   assert(strstr(stage3_last_event,"startup_lock") && strstr(stage3_last_event,"errno=5"));
-  /* Missing existing-data is bounded by monotonic time; invalid owner never
-   * waits. */
-  success_fixture();
-  remove_file("/data/extm/owner");
-  path(p, "/data/extm");
-  assert(!rmdir(p));
-  file("/vendor/etc/lge-zram.conf", "data_wait_seconds=2\n");
-  data_sleeps = 0;
-  assert(stage3_start(0,0) == 1);
-  assert(data_sleeps == 0); /* Failed one-shot property set never retries. */
-  /* Stage 3 module -> cold recovery -> property -> init mkdir simulation ->
-   * exclusive native owner -> helper -> activation. Wrong/stale ack refuses. */
-  for(int m=1;m<=3;m++) {
+  /* Startup never creates the tree or authority, even if legacy state exists. */
+  for(int missing=0;missing<3;missing++) {
     success_fixture();
-    remove_file("/data/extm/owner");path(p,"/data/extm");assert(!rmdir(p));
-    provision_mode=m;provision_ack[0]=0;provision_sets=0;
-    assert(stage3_start(0,0)==(m==1?0:1));
-    assert(provision_sets==(m==3?0:1));
-  }
-  for(int m=4;m<=7;m++) {
-    success_fixture();remove_file("/data/extm/owner");
-    path(p,"/data/extm");assert(!rmdir(p));
-    file("/vendor/etc/lge-zram.conf","data_wait_seconds=3\n");
-    provision_mode=m;provision_ack[0]=0;provision_sets=0;
-    provision_polls=provision_sleeps=0;
     unsigned prepares=helper_ops[NZM_HELPER_PREPARE];
-    assert(stage3_start(0,0)==(m==4?0:1));
-    assert(provision_sets==1);
-    if(m==4)assert(provision_polls==4 && provision_sleeps==3);
-    else {
-      assert(helper_ops[NZM_HELPER_PREPARE]==prepares);
-      if(m==6)assert(provision_polls==1 && provision_sleeps==0);
-      else assert(provision_polls==4 && provision_sleeps==3);
+    dir("/data/extm",0700);
+    dir("/data/extm/state",0700);
+    file("/data/extm/state/authority","extm-wear-v1\n");
+    char legacy[1024]; path(legacy,"/data/extm/state/authority");
+    struct stat saved, current;
+    assert(!stat(legacy,&saved));
+    remove_file("/data/vendor/extm/state/authority");
+    if(missing) {
+      remove_file("/data/vendor/extm/state/ledger");
+      path(p,"/data/vendor/extm/state");assert(!rmdir(p));
     }
-    if(m==7) {
-      /* Inject the late platform result after main already returned. No owner
-       * or helper operation may follow the expired request. */
-      unsigned prior=helper_ops[NZM_HELPER_CREATE];
-      dir("/data/extm",0700);
-      strcpy(provision_ack,"01234567-89ab-cdef-0123-456789abcdef");
-      path(p,"/data/extm/owner");assert(access(p,F_OK)<0 && errno==ENOENT);
-      assert(helper_ops[NZM_HELPER_CREATE]==prior && provision_polls==4);
+    if(missing==2) {
+      remove_file("/data/vendor/extm/owner");
+      path(p,"/data/vendor/extm");assert(!rmdir(p));
     }
+    assert(stage3_start(0,0)==1);
+    assert(!stat(legacy,&current) && current.st_ino==saved.st_ino && current.st_size==saved.st_size);
+    assert(helper_ops[NZM_HELPER_PREPARE]==prepares);
+    path(p,"/data/vendor/extm/state/authority");assert(access(p,F_OK)<0 && errno==ENOENT);
   }
-  for(int k=0;k<2;k++) {
-    success_fixture();remove_file("/data/extm/owner");
-    path(p,"/data/extm");assert(!rmdir(p));
-    provision_mode=1;provision_ack[0]=0;provision_sets=0;
-    crypto_type=k?"none":"file";
-    assert(stage3_start(0,0)==(k?0:1));
-    assert(provision_sets==(k?1:0));
-  }
-  crypto_type="";provision_mode=0;provision_ack[0]=0;
+  char *native_boot[]={"native-zram-manager","boot","--confirmed",NULL};
   /* Fully valid existing owner+file must retain inode and skip PREPARE. */
-  success_fixture();path(p,"/data/extm/file");
+  success_fixture();path(p,"/data/vendor/extm/file");
   f=open(p,O_RDWR|O_CREAT|O_EXCL,0600);assert(f>=0);
   assert(!ftruncate(f,512*1048576LL));struct stat existing,after;
   assert(!fstat(f,&existing));close(f);
@@ -594,15 +533,36 @@ int main(void) {
   unsigned old_create=helper_ops[NZM_HELPER_CREATE];
   unsigned old_query=helper_ops[NZM_HELPER_QUERY];
   unsigned old_bind=helper_ops[NZM_HELPER_BIND];
-  assert(!stage3_start(0,0));
+  assert(!nzm_entry(3,native_boot));
   assert(helper_ops[NZM_HELPER_PREPARE]==old_prepare);
   assert(helper_ops[NZM_HELPER_CREATE]==old_create+1);
   assert(helper_ops[NZM_HELPER_QUERY]>old_query);
   assert(helper_ops[NZM_HELPER_BIND]==old_bind+1);
-  path(p,"/data/extm/file");assert(!stat(p,&after));
+  path(p,"/data/vendor/extm/file");assert(!stat(p,&after));
   assert(existing.st_dev==after.st_dev && existing.st_ino==after.st_ino && existing.st_size==after.st_size);
+  /* A new bootstrapped root has just state: create owner and prepare once. */
+  success_fixture(); remove_file("/data/vendor/extm/owner");
+  old_prepare=helper_ops[NZM_HELPER_PREPARE];
+  assert(!nzm_entry(3,native_boot) && helper_ops[NZM_HELPER_PREPARE]==old_prepare+1);
+  path(p,"/data/vendor/extm/owner"); assert(!stat(p,&after) && after.st_size==sizeof "extm-dm-owner-v1\n"-1);
+  /* Existing partial, orphaned, or unlabelled file is never an absent file. */
+  for(int invalid=0;invalid<3;invalid++) {
+    success_fixture(); path(p,"/data/vendor/extm/file");
+    f=open(p,O_RDWR|O_CREAT|O_EXCL,0600); assert(f>=0);
+    assert(!ftruncate(f,invalid==0?4096:512*1048576LL));
+    assert(!fstat(f,&existing) && !close(f));
+    if(invalid==1) remove_file("/data/vendor/extm/owner");
+    missing_backing_label=invalid==2;
+    old_prepare=helper_ops[NZM_HELPER_PREPARE]; old_create=helper_ops[NZM_HELPER_CREATE];
+    unsigned old_swaps=swap_calls;
+    assert(nzm_entry(3,native_boot)==1);
+    missing_backing_label=0;
+    assert(helper_ops[NZM_HELPER_PREPARE]==old_prepare && helper_ops[NZM_HELPER_CREATE]==old_create);
+    assert(!stat(p,&after) && after.st_ino==existing.st_ino && after.st_size==existing.st_size);
+    assert(swap_calls==old_swaps);
+  }
   success_fixture();
-  file("/data/extm/owner", "foreign\n");
+  file("/data/vendor/extm/owner", "foreign\n");
   data_sleeps = 0;
   assert(stage3_start(0,0) == 1 && data_sleeps == 0);
   /* Failed second owner cannot change startup evidence or owner's local event. */
@@ -792,7 +752,7 @@ int main(void) {
   }
   /* Ledger IO failure before reserve cannot produce a request. */
   success_fixture();nzm_core_init(&owner);assert(!nzm_core_boot(&owner));owner.boot_completed=1;
-  remove_file("/mnt/vendor/persist/lge-zram-wear/ledger");rq=request_calls;
+  remove_file("/data/vendor/extm/state/ledger");rq=request_calls;
   assert(nzm_core_cycle(&owner)<0 && request_calls==rq && !owner.reserved);
   nzm_core_close(&owner);watermark_probe=0;
   puts("PASS historical legacy-v1 shared NO_PROGRESS original evidence, low/power/shrink resistance, 4/16/64K plan/ledger/limit, identity and ledger IO faults");

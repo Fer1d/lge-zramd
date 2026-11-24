@@ -18,7 +18,8 @@
 static const char *const keys[NZM_BOOT_ENTRIES] = {
   "minfree", "vm-attempted-boot", "vm-complete-boot",
   "vm-attempted-completed", "vm-complete-completed", "acquire-intent",
-  "bootstrap-result", "managed", "ram-only-attempted", "ram-only"
+  "bootstrap-result", "managed", "ram-only-attempted", "ram-only",
+  "prepare-attempted"
 };
 static const char transaction[] = "nzm-boot-txn-v1\n";
 static int key_index(const char *name) {

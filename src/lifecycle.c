@@ -2,6 +2,7 @@
 #include "demand_watch.h"
 #include "nzm_internal.h"
 #include "recovery.h"
+#include "state_bootstrap.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,7 +28,7 @@
 
 void nzm_core_init(struct nzm_core *c) {
   memset(c, 0, sizeof *c);
-  c->runfd = c->wearfd = c->datafd = c->lock.fd = -1;
+  c->runfd = c->wearfd = c->datafd = c->startupfd = c->lock.fd = -1;
   nzm_boot_init(&c->boot_state);
   (void)nzm_memory_init(&c->memory_budget, 0);
   c->execution.next_request_id = 1;
@@ -41,7 +42,9 @@ void nzm_core_close(struct nzm_core *c) {
     close(c->wearfd);
   if (c->datafd >= 0)
     close(c->datafd);
-  c->runfd=c->wearfd=c->datafd=c->lock.fd=-1;
+  if (c->startupfd >= 0)
+    close(c->startupfd);
+  c->runfd=c->wearfd=c->datafd=c->startupfd=c->lock.fd=-1;
 }
 int nzm_core_config(struct nzm_core *c) {
   int d = nzm_directory("/vendor/etc");
@@ -95,11 +98,10 @@ int nzm_core_bootid(struct nzm_core *c) {
 static int start(struct nzm_core *c, int phase1) {
   (void)phase1;
   int rc = nzm_core_bootid(c);
-  if (!rc) rc = nzm_persist_verify();
+  if (!rc) rc = nzm_state_open(&c->startupfd, &c->wearfd);
   if (rc) return rc;
-  c->wearfd = nzm_private(WEAR, WCTX);
-  if (c->wearfd < 0) return c->wearfd;
   if ((rc = nzm_boot_lock(&c->boot_state, c->wearfd))) return rc;
+  if ((rc = nzm_core_authority(c))) return rc;
   c->lock.fd = c->boot_state.authority_fd;
   c->lock.dev = c->boot_state.authority_dev;
   c->lock.ino = c->boot_state.authority_ino;
@@ -121,6 +123,7 @@ static int start(struct nzm_core *c, int phase1) {
   if (rc && rc != -ENOENT) return rc;
   /* A missing or previous-boot checkpoint is never proof of ownership. */
   if ((rc = nzm_cold()) || (rc = nzm_no_mapping())) return rc;
+  if ((rc = nzm_core_authority(c))) return rc;
   return nzm_boot_reset(&c->boot_state, c->boot, binding);
 }
 #ifdef NZM_LEGACY_TEST
@@ -213,8 +216,8 @@ int nzm_phase1_start(struct nzm_core *c, int daemon) {
     fputs("config_scope=startup_loaded next_boot_only=1 reload=unsupported\n", stderr);
     nzm_config_snapshot(c, stderr, 1);
   }
-  if ((rc = nzm_persist_verify()))
-    return nzm_diag(c, "persist_provenance", rc);
+  if ((rc = nzm_data_verify()))
+    return nzm_diag(c, "data_provenance", rc);
   int paused;
   if ((rc = nzm_phase1_policy(c, &paused)))
     return nzm_diag(c, "authority_or_pending", rc);

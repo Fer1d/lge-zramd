@@ -5,6 +5,14 @@
 #include <string.h>
 static int intent, managed, ram, attempt, mapping, identity_error, fail_op, drift;
 static int helpers, mutations, activated, fallback, enabled, limit, bound;
+static int preparations, prepare_error, prepare_mapping;
+int nzm_backend_prepare(struct nzm_core *c, struct nzm_helper_identity *id) {
+  preparations++;
+  if (prepare_mapping) mapping=1;
+  if (prepare_error) return prepare_error;
+  identity_error=0;
+  return nzm_existing_identity(c,id,0);
+}
 int nzm_core_authority(struct nzm_core *c) { (void)c; return 0; }
 int nzm_state_absent(struct nzm_core *c, const char *name) {
   return nzm_absent(c->wearfd,name);
@@ -65,6 +73,7 @@ int nzm_dm_activate(struct nzm_core *c, const struct nzm_helper_identity *id) {
 int nzm_managed(struct nzm_core *c) { (void)c; assert(managed); return 0; }
 int nzm_ram_boot(struct nzm_core *c) { (void)c; assert(!mutations); fallback++; return 0; }
 static void reset(void) {
+  preparations=prepare_error=prepare_mapping=0;
   intent=managed=ram=attempt=mapping=identity_error=drift=0;
   helpers=mutations=activated=fallback=enabled=bound=0; limit=9; fail_op=-1;
 }
@@ -72,7 +81,14 @@ int main(void) {
   struct nzm_core c={0}; c.config.enable_writeback=1;
   reset(); assert(!nzm_dm_boot(&c)); assert(helpers==3 && activated==1 && managed && !fallback);
   assert(!nzm_dm_boot(&c)); assert(helpers==3 && activated==1);
-  reset(); identity_error=-ENODATA; assert(!nzm_dm_boot(&c)); assert(fallback==1 && !intent);
+  reset(); identity_error=-ENODATA; assert(!nzm_dm_boot(&c));
+  assert(preparations==1 && helpers==3 && managed && !fallback);
+  reset(); identity_error=-ENODATA; prepare_error=-EIO;
+  assert(!nzm_dm_boot(&c)); assert(fallback==1 && !intent && preparations==1);
+  reset(); identity_error=-ENODATA; prepare_error=-EACCES;
+  assert(!nzm_dm_boot(&c)); assert(fallback==1 && !intent);
+  reset(); identity_error=-ENODATA; prepare_error=-EIO; prepare_mapping=1;
+  assert(nzm_dm_boot(&c)==-EEXIST && !fallback && !helpers);
   reset(); identity_error=-EACCES; assert(nzm_dm_boot(&c)==-EACCES && !mutations && !fallback);
   reset(); intent=1; assert(nzm_dm_boot(&c)==-EEXIST && !helpers && !fallback);
   reset(); attempt=1; assert(nzm_dm_boot(&c)==-EEXIST && !helpers);

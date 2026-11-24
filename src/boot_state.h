@@ -4,7 +4,7 @@
 #include <sys/types.h>
 
 #define NZM_BOOT_BINDING_MAX 512
-#define NZM_BOOT_ENTRIES 10
+#define NZM_BOOT_ENTRIES 11
 #define NZM_BOOT_VALUE_MAX 256
 /* Startup checkpoints only. No event log, execution intents, or wear records. */
 struct nzm_boot_state {

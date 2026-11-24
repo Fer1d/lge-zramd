@@ -6,7 +6,8 @@
 #include "runtime.h"
 
 #define MIB UINT64_C(1048576)
-#define WEAR "/mnt/vendor/persist/lge-zram-wear"
+#define EXTM "/data/vendor/extm"
+#define WEAR EXTM "/state"
 #define Z "/sys/block/zram0/"
 #define RCTX "u:object_r:lge_zram_runtime_file:s0"
 #define DCTX "u:object_r:extm_root_data:s0"
@@ -26,7 +27,6 @@ int nzm_core_ready(struct nzm_core *c);
 /* Trusted read-only boot identity; does not initialize startup ownership. */
 int nzm_core_bootid(struct nzm_core *c);
 int nzm_directory(const char *path);
-int nzm_private(const char *path, const char *ctx);
 int nzm_rawread(const char *p, char *b, size_t cap);
 int nzm_text(int fd, const char *name, const char *ctx, char *b,
                 size_t cap);

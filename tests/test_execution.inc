@@ -110,7 +110,7 @@ static void legacy_mm_stat_tests(void) {
       assert(!strcmp(c.stage,"sample_unknown") && !c.reserved && !c.attempted);
       assert(!rb_exec_calls && !rb_legacy_calls && !rb_idle_writes && !rb_quota_writes);
       assert(!ledger_generation() && readnum("/sys/block/zram0/writeback_limit")==7777);
-      assert(!fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent"));
+      assert(!fixture_exists("/data/vendor/extm/state/exec.intent"));
       nzm_core_close(&c);
     }
   }
@@ -153,7 +153,7 @@ static void execution_tests(void) {
     if(failure==3) {rb_status_errno=ENOTTY;file("/vendor/etc/lge-zram.conf","request_backend=ioctl\n");}
     assert(stage3_start(1,0)==1);
     assert(!rb_exec_calls && !rb_legacy_calls && !rb_idle_writes && !rb_quota_writes);
-    assert(!ledger_generation() && fixture_exists("/mnt/vendor/persist/lge-zram-wear/pause"));
+    assert(!ledger_generation() && fixture_exists("/data/vendor/extm/state/pause"));
     fd_closed();
   }
   /* Global quota zero or one unit below the plan: wait, never reserve/refill or
@@ -164,7 +164,7 @@ static void execution_tests(void) {
     assert(!nzm_core_cycle(&c));
     assert(!strcmp(c.stage,"waiting_kernel_limit") && !c.reserved && !c.attempted);
     assert(!ledger_generation() && !rb_exec_calls && !rb_legacy_calls && !rb_quota_writes);
-    assert(!fixture_exists("/mnt/vendor/persist/lge-zram-wear/pause"));
+    assert(!fixture_exists("/data/vendor/extm/state/pause"));
     rb_remaining=1024;
     assert(!nzm_core_cycle(&c) && c.reserved && c.attempted && rb_exec_calls==1);
     assert(c.execution.result.known && c.execution.result.counters.submitted_pages==1024);
@@ -181,7 +181,7 @@ static void execution_tests(void) {
     assert(nzm_core_cycle(&c)<0 && c.execution.halted && c.reserved && c.attempted);
     assert(c.execution.result.no_replay && !c.execution.result.known);
     assert(rb_exec_calls==1 && !rb_legacy_calls && ledger_generation()==1 && !rb_quota_writes);
-    assert(fixture_exists("/mnt/vendor/persist/lge-zram-wear/pause"));
+    assert(fixture_exists("/data/vendor/extm/state/pause"));
     unsigned statuses=rb_status_calls;
     rb_status_errno=ENOTTY;c.config.request_backend=NZM_REQUEST_LEGACY;
     assert(nzm_core_cycle(&c)<0 && nzm_execution_select(&c)<0);
@@ -198,8 +198,8 @@ static void execution_tests(void) {
     if(partial) {rb_op_errno=-EIO;rb_stop_reason=ZRAM_WB_STOP_ERROR;}
     else rb_exec_errno=EFAULT;
     assert(stage3_start(1,0)==1 && rb_exec_calls==1 && ledger_generation()==1);
-    assert(fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent"));
-    assert(!fixture_exists("/mnt/vendor/persist/lge-zram-wear/pause"));
+    assert(fixture_exists("/data/vendor/extm/state/exec.intent"));
+    assert(!fixture_exists("/data/vendor/extm/state/pause"));
     for(int legacy=0;legacy<2;legacy++) {
       file("/vendor/etc/lge-zram.conf",legacy?"request_backend=legacy\n":"request_backend=ioctl\n");
       assert(stage3_start(1,0)==1 && rb_exec_calls==1 && !rb_legacy_calls && ledger_generation()==1);
@@ -208,18 +208,18 @@ static void execution_tests(void) {
   for(int failure=1;failure<=4;failure++) {
     request_fixture();intent_fault=failure;
     assert(stage3_start(1,0)==1 && !rb_exec_calls && !rb_legacy_calls && !ledger_generation());
-    assert(fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent")== (failure!=1));
+    assert(fixture_exists("/data/vendor/extm/state/exec.intent")== (failure!=1));
   }
   for(int failure=5;failure<=6;failure++) {
     struct nzm_core retained;request_owner(&retained);intent_fault=failure;fail_pause_create=1;
     assert(nzm_core_cycle(&retained)<0 && rb_exec_calls==1 && retained.execution.result.known);
     assert(!strcmp(retained.stage,"intent_retire_uncertain") && retained.execution.halted);
-    assert(fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent"));
+    assert(fixture_exists("/data/vendor/extm/state/exec.intent"));
     assert(nzm_core_cycle(&retained)<0 && rb_exec_calls==1);
     nzm_core_close(&retained);
   }
   request_fixture();assert(stage3_start(1,0)==1 && rb_exec_calls==1);
-  assert(!fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent") && intent_syncs==1);
+  assert(!fixture_exists("/data/vendor/extm/state/exec.intent") && intent_syncs==1);
   puts("PASS exec.intent: EFAULT/knownpartial + pause ENOSPC, restart legacy/ioctl blocked; create/shortwrite/fsync failure zero EXEC; knownsuccess retires");
   /* Precise no-progress uses installed, never submitted or global bd writes. */
   struct nzm_core c;request_owner(&c);rb_installed=0;
@@ -236,7 +236,7 @@ static void execution_tests(void) {
   char ledger[256];unsigned long long now=(unsigned long long)time(NULL);
   snprintf(ledger,sizeof ledger,"wear-v1 9 %llu 36\n",now);
   size_t n=strlen(ledger);for(int i=0;i<9;i++)n+=(size_t)snprintf(ledger+n,sizeof ledger-n,"%llu 4\n",now);
-  file("/mnt/vendor/persist/lge-zram-wear/ledger",ledger);
+  file("/data/vendor/extm/state/ledger",ledger);
   assert(!nzm_core_cycle(&c) && rb_last_id==1 && ledger_generation()==10);
   monotonic_tick+=1000;assert(!nzm_core_cycle(&c) && rb_last_id==2 && ledger_generation()==11);
   c.execution.next_request_id=0;monotonic_tick+=1000;
@@ -251,8 +251,8 @@ static void execution_tests(void) {
     else {
       assert(!rc && rb_exec_calls==0 && rb_status_calls==before+3 && !ledger_generation());
       assert(!strcmp(c.stage,"waiting_sample_inconsistent") && !c.reserved && !c.execution.halted);
-      assert(!fixture_exists("/mnt/vendor/persist/lge-zram-wear/pause") &&
-             !fixture_exists("/mnt/vendor/persist/lge-zram-wear/exec.intent"));
+      assert(!fixture_exists("/data/vendor/extm/state/pause") &&
+             !fixture_exists("/data/vendor/extm/state/exec.intent"));
       assert(!nzm_core_cycle(&c) && rb_exec_calls==1 && ledger_generation()==1);
     }
     nzm_core_close(&c);

@@ -1,4 +1,5 @@
 #include "nzm_internal.h"
+#include "backend_prepare.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <string.h>
@@ -56,7 +57,20 @@ int nzm_dm_boot(struct nzm_core *c) {
       (rc = nzm_cold())) return rc;
   if (!c->config.enable_writeback) return nzm_ram_boot(c);
   rc = nzm_existing_identity(c, &id, 1);
-  if (rc == -ENODATA) return nzm_ram_boot(c);
+  if (rc == -ENODATA) {
+    rc = nzm_backend_prepare(c, &id);
+    if (rc) {
+      /* Preparation may have left partial persistent storage. Never remove or
+       * replay it, and never use RAM to conceal a possible acquisition. */
+      int safe = nzm_core_authority(c);
+      if (!safe) safe = nzm_state_absent(c, "acquire-intent");
+      if (!safe) safe = nzm_state_absent(c, "bootstrap-result");
+      if (!safe) safe = nzm_state_absent(c, "managed");
+      if (!safe) safe = nzm_no_mapping();
+      if (!safe) safe = nzm_cold();
+      return safe ? safe : nzm_ram_boot(c);
+    }
+  }
   if (rc) return rc;
   /* Fence before the first mutation, including quota writes. */
   if ((rc = nzm_mark(c, "acquire-intent", c->boot)) ||

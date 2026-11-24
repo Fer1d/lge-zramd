@@ -11,7 +11,7 @@ CC=${CC:-cc}
 FLAGS=(-std=c11 -Wall -Wextra -Werror -g -pthread -D_FILE_OFFSET_BITS=64 -I"$ROOT/src" -Wl,-z,now)
 RBWARN=(-Wconversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes)
 source "$ROOT/sources.sh"
-CORE_MODULES=(core lifecycle backend dm_backend demand_watch demand_exec swap vm metrics policy executor execution intent event_daemon diagnostics boot_state memory_budget wear_budget wear_store log)
+CORE_MODULES=(core lifecycle state_bootstrap backend backend_prepare dm_backend demand_watch demand_exec swap vm metrics policy executor execution intent event_daemon diagnostics boot_state memory_budget wear_budget wear_store log)
 CORE_SOURCES=()
 for SRC in "${CORE_MODULES[@]}"; do CORE_SOURCES+=("$ROOT/src/$SRC.c"); done
 MODULES=("$ROOT/src/spawn_fd.c" "$ROOT/src/request_backend.c" "$ROOT/src/runtime.c" "$ROOT/src/psi.c")
@@ -125,7 +125,7 @@ python3 -I "$ROOT/tests/check_child_trace.py" "$TRACE" > "$BUILD/child-trace-che
 "$LLVM/aarch64-linux-android29-clang" "${FLAGS[@]}" "${PRODUCTION[@]}" -O2 -fPIE -pie "${SOURCES[@]}" -llog -o "$BUILD/native-zram-manager.android29.arm64"
 "$LLVM/llvm-nm" --defined-only "$BUILD/native-zram-manager.android29.arm64" > "$BUILD/symbols-arm64.txt"
 # Production must not depend on historical schedulers or persistent budgets.
-if grep -Eq ' (nzm_(core_(boot|daemon|cycle|provision)|event_daemon|runtime_create|execution_execute|wear|wear_store_[a-z_]+|budget_[a-z_]+|ledger_[a-z_]+|io_ledger_commit)|rb_execute)$' "$BUILD/symbols-arm64.txt"; then
+if grep -Eq ' (nzm_(core_(boot|daemon|cycle)|event_daemon|runtime_create|execution_execute|wear|wear_store_[a-z_]+|budget_[a-z_]+|ledger_[a-z_]+|io_ledger_commit)|rb_execute)$' "$BUILD/symbols-arm64.txt"; then
     printf '%s\n' 'FAIL: legacy writeback/provisioning/runtime code in disarmed artifact' >&2
     exit 1
 fi

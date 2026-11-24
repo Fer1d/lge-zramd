@@ -18,10 +18,13 @@ int test_stat(const char *, struct stat *);
 /* test_mounts.c executes the full production mounted()/mounts_verify chain
  * with syscall-boundary fixtures; test_recovery.c additionally tests its parser.
  * Core fixtures model the approved mount contract at this module boundary. */
-#ifndef NZM_RECOVERY_ADAPTER
+#ifdef NZM_RECOVERY_ADAPTER
+#define NZM_VERIFY_VENDOR_MOUNT(data, vendor) ((void)(data), (void)(vendor), 0)
+#else
 static inline int test_mounts_verify(void) { return 0; }
 #define nzm_mounts_verify test_mounts_verify
 #define nzm_persist_verify test_mounts_verify
+#define nzm_data_verify test_mounts_verify
 #endif
 #ifdef NZM_INTEGRATION
 #include "nzm_io.h"

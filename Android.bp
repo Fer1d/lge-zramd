@@ -2,7 +2,7 @@ cc_binary {
     name: "lge-zramd",
     stem: "lge-zramd",
     vendor: true,
-    srcs: ["src/main.c", "src/core.c", "src/lifecycle.c", "src/backend.c", "src/dm_backend.c",
+    srcs: ["src/main.c", "src/core.c", "src/lifecycle.c", "src/state_bootstrap.c", "src/backend.c", "src/backend_prepare.c", "src/dm_backend.c",
         "src/demand_watch.c", "src/demand_exec.c",
         "src/memory_budget.c", "src/boot_state.c", "src/log.c",
         "src/swap.c", "src/vm.c", "src/metrics.c", "src/policy.c",
