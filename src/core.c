@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "nzm_internal.h"
-#include "recovery.h"
+#include "state_bootstrap.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -39,16 +39,19 @@ static int path_error(const char *op, const char *path, int rc) {
   return rc;
 }
 /* Ancestors need traversal/metadata only, never directory-content read.
- * Root-owned nonwritable ancestors need no exact gid/mode. The persist
- * mount alone permits its platform system group to write (never other).
+ * Userdata is opened through its dedicated O_PATH metadata verifier.
  * Leaves stay O_RDONLY for existing exact metadata/xattr and fsync users. */
 static int directory_meta(const char *path, const struct stat *st) {
   if (!S_ISDIR(st->st_mode)) return -ENOTDIR;
   if (st->st_uid || (st->st_mode & 0002)) return -EPERM;
   if (!(st->st_mode & 0020)) return 0;
-  /* Required Android persist trust, not a generic group-writable exception. */
+#ifdef NZM_LEGACY_TEST
   return !strcmp(path,"/mnt/vendor/persist") && st->st_gid==1000 &&
          !(st->st_mode & 07000) ? 0 : -EPERM;
+#else
+  (void)path;
+  return -EPERM;
+#endif
 }
 int nzm_directory(const char *path) {
   char b[256], current[256] = "", *cursor, *p;
@@ -83,18 +86,6 @@ int nzm_directory(const char *path) {
     fd = n;
     rc = fstat(fd, &st) ? -errno : directory_meta(current, &st);
     if (rc) { close(fd); return path_error("fstat/metadata", current, rc); }
-  }
-  return fd;
-}
-int nzm_private(const char *path, const char *ctx) {
-  int fd = nzm_directory(path);
-  if (fd < 0)
-    return fd;
-  const struct nzm_meta m = {0, 0, 0700, 0, ctx};
-  int rc = nzm_io_check(fd, S_IFDIR, &m);
-  if (rc) {
-    close(fd);
-    return path_error("exact-metadata/xattr", path, rc);
   }
   return fd;
 }
@@ -145,7 +136,9 @@ int nzm_create_text(int fd, const char *name, const char *ctx,
   return rc;
 }
 int nzm_core_authority(struct nzm_core *c) {
-  return nzm_boot_assert(&c->boot_state);
+  if (c->wearfd != c->boot_state.dirfd) return -ESTALE;
+  int rc = nzm_state_bound(c->startupfd, c->wearfd);
+  return rc ? rc : nzm_boot_assert(&c->boot_state);
 }
 int nzm_state_absent(struct nzm_core *c, const char *name) {
   return nzm_boot_absent(&c->boot_state, name);
@@ -154,7 +147,8 @@ int nzm_state_text(struct nzm_core *c, const char *name, char *b, size_t cap) {
   return nzm_boot_text(&c->boot_state, name, b, cap);
 }
 int nzm_mark(struct nzm_core *c, const char *name, const char *s) {
-  return nzm_boot_mark(&c->boot_state, name, s);
+  int rc = nzm_core_authority(c);
+  return rc ? rc : nzm_boot_mark(&c->boot_state, name, s);
 }
 int nzm_put(const char *p, const char *s) {
   int fd = open(p, O_WRONLY | O_NOFOLLOW | O_CLOEXEC);

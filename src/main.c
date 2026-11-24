@@ -1,9 +1,19 @@
 #include "nzm_core.h"
 #include "recovery.h"
+#include "state_bootstrap.h"
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
+  /* Init launches this command in lge_zram_bootstrap, never the daemon domain. */
+  if (argc >= 2 && !strcmp(argv[1], "bootstrap")) {
+    if (argc != 3 || strcmp(argv[2], "--confirmed")) return 2;
+    if (geteuid() != 0) { fprintf(stderr, "root required\n"); return 1; }
+    int rc = nzm_state_bootstrap();
+    if (rc) fprintf(stderr, "command=bootstrap errno=%d no_cleanup_no_retry\n", -rc);
+    else puts("state_bootstrap=valid");
+    return rc ? 1 : 0;
+  }
   /* Read-only executable preflight, before all config/core/lock paths. */
   if (argc >= 2 && !strcmp(argv[1], "preflight-helper")) {
     if (argc != 2) return 2;
@@ -17,7 +27,7 @@ int main(int argc, char **argv) {
   if (argc >= 2 && !strcmp(argv[1], "check-mounts")) {
     if (argc != 2) return 2;
     if (geteuid() != 0) { fprintf(stderr, "root required\n"); return 1; }
-    int rc = nzm_mounts_verify();
+    int rc = nzm_data_verify();
     if (rc) fprintf(stderr, "command=check-mounts errno=%d no_cleanup_no_retry\n", -rc);
     else puts("mounts=valid");
     return rc ? 1 : 0;
@@ -26,7 +36,7 @@ int main(int argc, char **argv) {
       !(!strcmp(argv[1], "status") || !strcmp(argv[1], "check-config") ||
         !strcmp(argv[1], "checkconfig") || !strcmp(argv[1], "boot") ||
         !strcmp(argv[1], "daemon") || !strcmp(argv[1], "pause"))) {
-    fprintf(stderr, "usage: native-zram-manager status|check-config|check-mounts|preflight-helper|boot "
+    fprintf(stderr, "usage: native-zram-manager status|check-config|check-mounts|preflight-helper|bootstrap --confirmed|boot "
                     "--confirmed|daemon --confirmed [--boot-completed]|pause --confirmed\n");
     return 2;
   }

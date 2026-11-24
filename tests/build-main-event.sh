@@ -10,7 +10,7 @@ CC=${CC:-cc}
 source "$ROOT/sources.sh"
 FLAGS=(-std=c11 -Wall -Wextra -Werror -g -pthread -D_FILE_OFFSET_BITS=64 -I"$ROOT/src" -I"$ROOT/tests")
 TEST_FLAGS=(-DNZM_LEGACY_TEST)
-CORE=(core lifecycle backend dm_backend demand_watch demand_exec swap vm metrics policy executor execution intent event_daemon diagnostics boot_state memory_budget wear_budget wear_store log)
+CORE=(core lifecycle state_bootstrap backend backend_prepare dm_backend demand_watch demand_exec swap vm metrics policy executor execution intent event_daemon diagnostics boot_state memory_budget wear_budget wear_store log)
 MODULES=(planner config ledger helper request_backend runtime psi spawn_fd)
 ADAPTER="$ROOT/tests/event_adapter.h"
 export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:abort_on_error=1}

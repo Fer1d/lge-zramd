@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "nzm_internal.h"
 #include "recovery.h"
+#include "state_bootstrap.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -22,7 +23,7 @@
 #include NZM_CORE_ADAPTER
 #endif
 
-struct recovery_state { struct nzm_core *core; int data; };
+struct recovery_state { struct nzm_core *core; int parent; };
 static int wear_authority(struct nzm_core *c) {
   if (c->boot_state.authority_fd >= 0) return nzm_core_authority(c);
   static const char authority[] = "extm-wear-v1\n";
@@ -30,7 +31,7 @@ static int wear_authority(struct nzm_core *c) {
   size_t len;
   const struct nzm_meta meta = {0, 0, 0600, 1, "u:object_r:extm_wear_authority:s0"};
   if (c->wearfd < 0) {
-    c->wearfd = nzm_private(WEAR, WCTX);
+    c->wearfd = nzm_state_readonly();
     if (c->wearfd < 0)
       return c->wearfd;
   }
@@ -81,51 +82,30 @@ int nzm_wear(struct nzm_core *c, struct nzm_ledger *l) {
   return rc;
 }
 #endif
-static int data_open(struct nzm_core *c, int allow_create) {
-  (void)allow_create; /* Fresh-data provisioning requires a separate
-                         policy-reviewed helper. */
-  int root = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  if (root < 0)
-    return -errno;
-  int d = nzm_io_data_dir(root);
-  close(root);
-  if (d < 0)
-    return d;
-  int fd = nzm_io_private_dir_at(d, "extm", DCTX);
-  close(d);
-  if (fd < 0)
-    return fd;
-  if (c->datafd >= 0)
-    close(c->datafd);
+static int data_open(struct nzm_core *c) {
+  int parent = nzm_vendor_parent();
+  if (parent < 0) return parent;
+  int fd = nzm_io_private_dir_at(parent, "extm", DCTX);
+  int rc = fd < 0 ? fd : nzm_bound_dir(parent, "extm", fd);
+  if (!rc) rc = nzm_bound_dir(parent, "extm", c->startupfd);
+  close(parent);
+  if (rc) { if (fd >= 0) close(fd); return rc; }
+  if (c->datafd >= 0) close(c->datafd);
   c->datafd = fd;
   return 0;
-}
-static int same_inode(int a,int b) {
-  struct stat x,y;
-  if(fstat(a,&x)||fstat(b,&y))return -errno;
-  return x.st_dev==y.st_dev&&x.st_ino==y.st_ino?0:-ESTALE;
 }
 static int recovery_verify(void *arg) {
   struct recovery_state *state=arg;
   struct nzm_core *c=state->core;
   if(c->lock.fd<0)return -EPERM;
-  int rc=nzm_mounts_verify();
+  int rc=nzm_core_authority(c);
+  if(!rc)rc=nzm_bound_dir(state->parent,"extm",c->startupfd);
   if(rc)return rc;
-  int wd=nzm_private(WEAR,WCTX);
-  if(wd<0)return wd;
-  if(c->wearfd>=0)rc=same_inode(wd,c->wearfd);
-  close(wd);if(rc)return rc;
-  if(state->data>=0) {
-    int root=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-    if(root<0)return -errno;
-    int d=nzm_io_data_dir(root);close(root);
-    if(d<0)return d;
-    rc=same_inode(d,state->data);close(d);if(rc)return rc;
-  }
-  /* Revalidate authorization and unresolved evidence, never historical budget.
-   * Recovery must not bypass a pause even if startup was previously allowed. */
+  /* Boot preparation authorization is distinct from demand authorization.
+   * Persistent execution/ledger evidence continues to fence writeback, but
+   * does not prevent preparing cold backing storage. An actual pause does. */
   int paused = 0;
-  if(!rc)rc=nzm_phase1_policy(c,&paused);
+  if(!rc)rc=nzm_pause_verified(c,&paused);
   if(!rc && paused)rc=-ECANCELED;
   if(!rc)rc=nzm_cold();
   if(!rc)rc=nzm_no_mapping();
@@ -133,67 +113,46 @@ static int recovery_verify(void *arg) {
   if(!rc)rc=nzm_state_absent(c,"bootstrap-result");
   return rc;
 }
-static int recovery_request(void *arg) {
-#ifdef __ANDROID__
-  struct nzm_core *c=((struct recovery_state *)arg)->core;
-  char b[PROP_VALUE_MAX];
-  __system_property_get("ro.crypto.type",b);
-  int crypto_rc=nzm_recovery_crypto_allowed(b);
-  if(crypto_rc)return crypto_rc;
-  if(__system_property_get("sys.extm.provision.request",b) ||
-     __system_property_get("sys.extm.provision.ack",b))return -EEXIST;
-  if(__system_property_set("sys.extm.provision.request",c->boot))return -EIO;
-  struct timespec start,tick;
-  if(clock_gettime(CLOCK_MONOTONIC,&start))return -errno;
-  for(;;) {
-    int n=__system_property_get("sys.extm.provision.ack",b);
-    if(n)return !strcmp(b,c->boot)?0:-EPERM;
-    if(clock_gettime(CLOCK_MONOTONIC,&tick))return -errno;
-    if(tick.tv_sec < start.tv_sec || start.tv_sec < 0)return -ERANGE;
-    if((uint64_t)tick.tv_sec-(uint64_t)start.tv_sec >= c->config.data_wait_seconds)return -ETIMEDOUT;
-    struct timespec delay={0,100000000};
-    if(c->control) {
-      struct timespec deadline;
-      int rc=nzm_runtime_deadline_after(&tick,UINT64_C(100000000),&deadline);
-      if(rc)return rc;
-      rc=nzm_runtime_control_wait_until(c->control,NZM_BOUNDARY_OBSERVING,&deadline);
-      if(rc<0)return rc;
-      if(rc)return nzm_core_control(c,NZM_BOUNDARY_OBSERVING);
-    } else if(nanosleep(&delay,NULL))return -errno;
-  }
-#else
-  (void)arg;return -ENOTSUP;
-#endif
-}
 int nzm_core_provision(struct nzm_core *c) {
-  struct recovery_state state={c,-1};
-  int rc=recovery_verify(&state);
-  if(rc)return rc;
-  int root=open("/",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-  if(root<0)return -errno;
-  int data=nzm_io_data_dir(root);close(root);
-  if(data<0)return data;
-  state.data=data;
-  struct nzm_recovery_ops ops={recovery_verify,recovery_request,&state};
-  int fd=-1;rc=nzm_recovery_owner(data,&ops,&fd);close(data);
-  if(!rc){if(c->datafd>=0)close(c->datafd);c->datafd=fd;}
+  if (c->lock.fd < 0) return -EPERM;
+  int parent = nzm_vendor_parent();
+  if (parent < 0) return parent;
+  struct recovery_state state = {c, parent};
+  struct nzm_recovery_ops ops = {recovery_verify, &state};
+  int fd = -1;
+  int rc = nzm_recovery_owner(parent, &ops, &fd);
+  close(parent);
+  if (!rc) {
+    if (c->datafd >= 0) close(c->datafd);
+    c->datafd = fd;
+  }
   return rc;
 }
-int nzm_existing_identity(struct nzm_core *c, struct nzm_helper_identity *id, int fallback) {
+static int existing_identity(struct nzm_core *c, struct nzm_helper_identity *id, int *missing) {
   /* Reopen by pathname every time: a removed/replaced active directory is NOT
    * repaired or accepted just because an old directory fd remains pinned. */
-  int rc = data_open(c, 0);
+  int rc = nzm_core_authority(c);
+  if (!rc) rc = data_open(c);
   if (rc)
     return rc;
-  char b[64];
-  if ((rc = nzm_text(c->datafd, "owner", OCTX, b, sizeof b)))
+  if ((rc = nzm_recovery_owner_read(c->datafd))) {
+    if (missing && rc == -ENOENT) {
+      rc = nzm_recovery_unowned(c->datafd);
+      if (!rc) rc = nzm_core_authority(c);
+      if (!rc) *missing = 1;
+      return rc;
+    }
     return rc;
-  if (strcmp(b, "extm-dm-owner-v1\n"))
-    return -EPERM;
+  }
   int f =
       openat(c->datafd, "file", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
-  if (f < 0)
-    return fallback && errno == ENOENT ? -ENODATA : -errno;
+  if (f < 0) {
+    if (!missing || errno != ENOENT) return -errno;
+    rc = nzm_absent(c->datafd, "file");
+    if (!rc) rc = nzm_core_authority(c);
+    if (!rc) *missing = 1;
+    return rc;
+  }
   const struct nzm_meta m = {0, 0, 0600, 1, FCTX};
   struct stat st;
   rc = nzm_io_check(f, S_IFREG, &m);
@@ -203,7 +162,7 @@ int nzm_existing_identity(struct nzm_core *c, struct nzm_helper_identity *id, in
   if (rc)
     return rc;
   if (st.st_size < 0 || (uint64_t)st.st_size != c->config.expected_bytes)
-    return fallback ? -ENODATA : -EPERM;
+    return -EPERM; /* Existing partial/foreign files are never candidates. */
   memset(id, 0, sizeof *id);
   id->bytes = c->config.expected_bytes;
   id->inode = st.st_ino;
@@ -211,6 +170,14 @@ int nzm_existing_identity(struct nzm_core *c, struct nzm_helper_identity *id, in
   id->backing_major = major(st.st_dev);
   id->backing_minor = minor(st.st_dev);
   return 0;
+}
+int nzm_existing_identity(struct nzm_core *c, struct nzm_helper_identity *id, int fallback) {
+  int missing = 0;
+  int rc = existing_identity(c, id, fallback ? &missing : NULL);
+  /* xattr lookup can also report ENODATA. Only proven pathname absence
+   * authorizes cold preparation, never missing security metadata. */
+  if (rc == -ENODATA) return -EPERM;
+  return rc ? rc : missing ? -ENODATA : 0;
 }
 int nzm_identity(struct nzm_core *c, struct nzm_helper_identity *id) {
   return nzm_existing_identity(c, id, 0);

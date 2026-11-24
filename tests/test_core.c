@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "nzm_core.h"
 #include "nzm_internal.h"
+#include "state_bootstrap.h"
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,7 +12,7 @@
 #include <unistd.h>
 static char root[256];
 static int writes, opens_write, deny_vm, wrong_data, wrong_owner, short_write;
-static int config_fault, forbid_ledger_io;
+static int config_fault, forbid_ledger_io, missing_backing_label;
 #ifdef NZM_INTEGRATION
 static void verify_precharge_at_request(void);
 static int fail_wb, fail_snapshot_short, fail_snapshot_sync, fail_attempt_open;
@@ -124,7 +125,9 @@ ssize_t test_xattr(int fd, const char *name, void *buf, size_t cap) {
     if (config_fault == 6) { errno = ENODATA; return -1; }
     type = config_fault == 5 ? "lge_zram_config_file" :
            config_fault == 7 ? "vendor_configs_file_suffix" : "vendor_configs_file";
-  } else if (strstr(p, "/lge-zram-wear")) {
+  } else if (!strcmp(p + strlen(root), "/data/vendor")) {
+    type = "vendor_data_file";
+  } else if (strstr(p, "/data/vendor/extm/state")) {
     type = "extm_wear_dir";
     if (strstr(p, "/authority"))
       type = "extm_wear_authority";
@@ -132,12 +135,14 @@ ssize_t test_xattr(int fd, const char *name, void *buf, size_t cap) {
       type = "extm_wear_ledger";
     else if (strstr(p, "/pause"))
       type = "extm_wear_pause";
-  } else if (strstr(p, "/data/extm")) {
+  } else if (strstr(p, "/data/vendor/extm")) {
     type = "extm_root_data";
     if (strstr(p, "/owner"))
       type = wrong_owner ? "extm_backing_data" : "extm_owner_data";
-    else if (strstr(p, "/file"))
+    else if (strstr(p, "/file")) {
+      if (missing_backing_label) { errno = ENODATA; return -1; }
       type = "extm_backing_data";
+    }
   }
   char b[128];
   snprintf(b, sizeof b, "u:object_r:%s:s0", type);
@@ -234,12 +239,11 @@ static void setup(void) {
   dir("/proc/sys", 0755);
   dir("/proc/sys/vm", 0755);
   dir("/data", 0771);
-  dir("/mnt", 0755);
-  dir("/mnt/vendor", 0755);
-  dir("/mnt/vendor/persist", 0755);
-  dir("/mnt/vendor/persist/lge-zram-wear", 0700);
-  file("/mnt/vendor/persist/lge-zram-wear/authority", "extm-wear-v1\n");
-  file("/mnt/vendor/persist/lge-zram-wear/ledger", "wear-v1 0 0 0\n");
+  dir("/data/vendor", 0771);
+  dir("/data/vendor/extm", 0700);
+  dir("/data/vendor/extm/state", 0700);
+  file("/data/vendor/extm/state/authority", "extm-wear-v1\n");
+  file("/data/vendor/extm/state/ledger", "wear-v1 0 0 0\n");
   const char *nodes[] = {
       "swappiness",        "page-cluster",    "watermark_scale_factor",
       "extra_free_kbytes", "min_free_kbytes", "overcommit_memory",
@@ -252,10 +256,7 @@ static void setup(void) {
 }
 static void init(struct nzm_core *c) {
   nzm_core_init(c);
-  char p[1024];
-  path(p, "/mnt/vendor/persist/lge-zram-wear");
-  c->wearfd = open(p, O_RDONLY | O_DIRECTORY);
-  assert(c->wearfd >= 0);
+  assert(!nzm_state_open(&c->startupfd, &c->wearfd));
   strcpy(c->boot, "01234567-89ab-cdef-0123-456789abcdef");
   assert(!nzm_boot_lock(&c->boot_state, c->wearfd));
   c->lock.fd = c->boot_state.authority_fd;
@@ -408,13 +409,12 @@ int main(void) {
   file("/sys/block/zram0/disksize", "0\n");
   file("/sys/block/zram0/backing_dev", "none\n");
   file("/proc/swaps", "Filename Type Size Used Priority\n");
-  dir("/data/extm", 0700);
-  file("/data/extm/foreign", "unknown\n");
+  file("/data/vendor/extm/foreign", "unknown\n");
   nzm_core_init(&c);
   assert(nzm_core_boot(&c) == -ENOTEMPTY);
   assert(!strcmp(c.stage, "data_provision"));
   char pause_path[1024];
-  path(pause_path, "/mnt/vendor/persist/lge-zram-wear/pause");
+  path(pause_path, "/data/vendor/extm/state/pause");
   assert(access(pause_path, F_OK) == 0);
   nzm_core_close(&c);
   puts("core: VM real read/write/readback, once-only x2/completed, "

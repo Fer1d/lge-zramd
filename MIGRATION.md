@@ -12,11 +12,11 @@ No budget parsing, version migration, immutable backup creation, settlement disk
 
 ## Safety state is not budget history
 
-The existing private persist directory remains for immutable `authority`, compact `boot-state`, pause and `exec.intent`. These protect singleton ownership, VM baseline/target, activation identity and unknown execution outcomes. They are not restored write budgets.
+The current daemon keeps immutable `authority`, compact `boot-state`, pause and `exec.intent` under `/data/vendor/extm/state`. These protect singleton ownership, VM baseline/target, activation identity and unknown execution outcomes. They are not restored write budgets.
 
-An old unowned `exec.intent` or unfinished `ledger.new`/`ledger.txn` remains an uncertainty fence. A fresh empty memory history does not authorize replay, repair or deletion. Basic swap remains supported under existing disarmed startup rules. Unknown/interrupted activation is left untouched, not reset, rebound or replayed.
+Moving from the old persist directory is a cold, coordinated transition. Stop the old controller and verify that it has no unresolved execution intent, incomplete activation or accounting transaction, or active pause that would be lost in the new directory. Old state remains untouched: neither a pause nor an uncertainty fence in the old directory is automatically carried forward. Do not proceed when the old state cannot be reconciled; do not clear evidence or replay an unknown request to force progress.
 
-The authority lock does not interoperate with the original mkdir-based /dev lock. An upgrade from the original controller requires coherent init/SELinux/context changes; an already coherent no-/dev installation should be inspected rather than blindly reapplying hash-pinned integration scripts. The new accounting does not create a /dev directory or require new persistent filenames.
+The authority lock does not interoperate with the old authority directory or the original mkdir-based `/dev` lock. Use the matching init, SELinux and file-context changes described in `integration/README.md`, and the matching backend helper for `/data/vendor/extm/file`. Do not run both controllers or blindly reapply the hash-pinned integration transform.
 
 ## Installation boundary
 

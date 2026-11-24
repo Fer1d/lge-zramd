@@ -9,6 +9,10 @@ SOURCES=(); for f in "${NZM_PRODUCTION_MODULES[@]}"; do [[ $f == main ]] || SOUR
 LEGACY_SOURCES=("${SOURCES[@]}"); for f in "${NZM_LEGACY_MODULES[@]}"; do LEGACY_SOURCES+=("$ROOT/src/$f.c"); done
 for variant in plain sanitized; do
  E=(); [[ $variant != sanitized ]] || E=(-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie)
+ cc "${FLAGS[@]}" "${E[@]}" "$ROOT/tests/test_state_bootstrap.c" "$ROOT/src/boot_state.c" -o "$B/state-bootstrap.$variant"
+ "$B/state-bootstrap.$variant"
+ cc "${FLAGS[@]}" "${E[@]}" "$ROOT/tests/test_backend_prepare.c" "$ROOT/src/backend_prepare.c" -o "$B/prepare.$variant"
+ "$B/prepare.$variant"
  cc "${FLAGS[@]}" "${E[@]}" "$ROOT/tests/test_boot_state.c" "$ROOT/src/boot_state.c" -o "$B/boot-state.$variant"
  "$B/boot-state.$variant"
  cc "${FLAGS[@]}" "${E[@]}" "$ROOT/tests/test_wear_budget.c" "$ROOT/src/wear_budget.c" "$ROOT/src/ledger.c" -o "$B/budget.$variant"

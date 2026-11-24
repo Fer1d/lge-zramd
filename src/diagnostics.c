@@ -2,6 +2,7 @@
 #include "nzm_internal.h"
 #include "recovery.h"
 #include "log.h"
+#include "state_bootstrap.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -77,11 +78,12 @@ int nzm_diag_config_error(const char *stage, const char *field, const char *reas
   return rc;
 }
 static int persist_pause(struct nzm_core *c) {
-  if (c->wearfd < 0)
-    c->wearfd = nzm_private(WEAR, WCTX);
-  int rc = c->wearfd < 0 ? c->wearfd
-                         : nzm_create_text(c->wearfd, "pause",
-                                       PCTX, NZM_PAUSE_RECORD);
+  if (c->wearfd < 0) {
+    int opened = nzm_state_open(&c->startupfd, &c->wearfd);
+    if (opened) return opened;
+  }
+  int rc = nzm_state_bound(c->startupfd, c->wearfd);
+  if (!rc) rc = nzm_create_text(c->wearfd, "pause", PCTX, NZM_PAUSE_RECORD);
   return rc == -EEXIST ? 0 : rc;
 }
 int nzm_core_pause(struct nzm_core *c, const char *reason) {
@@ -151,10 +153,10 @@ int nzm_core_status(struct nzm_core *c, FILE *out) {
         "charge_time=completion pending_expiry=never\n", out);
   int paused = 0;
   int rc = nzm_core_bootid(c);
-  if (!rc) rc = nzm_persist_verify();
+  if (!rc) rc = nzm_data_verify();
   int opened = 0;
   if (!rc && c->wearfd < 0) {
-    c->wearfd = nzm_private(WEAR, WCTX);
+    c->wearfd = nzm_state_readonly();
     if (c->wearfd < 0) rc = c->wearfd;
     else opened = 1;
   }

@@ -23,6 +23,7 @@ struct nzm_execution {
 struct nzm_core {
   struct nzm_config config;
   int runfd, wearfd, datafd; /* runfd retained for legacy test ABI; production stays -1. */
+  int startupfd; /* Independent extm directory flock; backend may reopen datafd. */
   struct nzm_boot_state boot_state;
   char last_event[1024];
   enum nzm_watermark_state watermark, watermark_resume;
